@@ -1,0 +1,920 @@
+%%%%%%%% ICML 2025 EXAMPLE LATEX SUBMISSION FILE %%%%%%%%%%%%%%%%%
+
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+
+% hyperref makes hyperlinks in the resulting PDF.
+% If your build breaks (sometimes temporarily if a hyperlink spans a page)
+% please comment out the following usepackage line and replace
+% \usepackage{icml2025} with \usepackage[nohyperref]{icml2025} above.
+\usepackage{hyperref}
+
+
+% Attempt to make hyperref and algorithmic work together better:
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use the following line for the initial blind version submitted for review:
+\usepackage[accepted]{icml2025}
+
+% If accepted, instead use the following line for the camera-ready submission:
+%\usepackage[accepted]{icml2025}
+
+% For theorems and such
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage{xspace}
+\usepackage{bbm}
+\usepackage{multirow}
+\usepackage{bm}
+\usepackage[usestackEOL]{stackengine}
+\usepackage{enumitem}
+\usepackage{svg}
+
+% if you use cleveref..
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\usepackage{pifont}
+\newcommand{\cmark}{\ding{51}}%
+\newcommand{\xmark}{\ding{55}}%
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% THEOREMS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+% Todonotes is useful during development; simply uncomment the next line
+%    and comment out the line below the next line to turn off comments
+%\usepackage[disable,textsize=tiny]{todonotes}
+\usepackage[textsize=tisny]{todonotes}
+
+\newcommand{\ours}{DiffMS\xspace}
+
+% The \icmltitle you define below is probably too long as a header.
+% Therefore, a short form for the running title is supplied here:
+\icmltitlerunning{DiffMS: Diffusion Generation of Molecules Conditioned on Mass Spectra}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{DiffMS: Diffusion Generation of Molecules Conditioned on Mass Spectra}
+
+% It is OKAY to include author information, even for blind
+% submissions: the style file will automatically remove it for you
+% unless you've provided the [accepted] option to the icml2025
+% package.
+
+% List of affiliations: The first argument should be a (short)
+% identifier you will use later to specify author affiliations
+% Academic affiliations should list Department, University, City, Region, Country
+% Industry affiliations should list Company, City, Region, Country
+
+% You can specify symbols, otherwise they are numbered in order.
+% Ideally, you should not use this facility. Affiliations will be numbered
+% in order of appearance and this is the preferred way.
+% \icmlsetsymbol{equal}{*}
+% \icmlsetsymbol{xxx}{\ddag}
+% \icmlsetsymbol{yyy}{\dag}
+% \icmlsetsymbol{msrp}{*}
+
+\begin{icmlauthorlist}
+\icmlauthor{Montgomery Bohde}{yyy,xxx}
+\icmlauthor{Mrunali Manjrekar}{yyy}
+\icmlauthor{Runzhong Wang}{yyy}
+\icmlauthor{Shuiwang Ji}{xxx}
+\icmlauthor{Connor W. Coley}{yyy}
+%\icmlauthor{}{sch}
+%\icmlauthor{}{sch}
+%\icmlauthor{}{sch}
+\end{icmlauthorlist}
+
+\icmlaffiliation{yyy}{Massachusetts Institute of Technology, Cambridge, MA, United States}
+\icmlaffiliation{xxx}{Texas A\&M University, College Station, TX, United States}
+% \icmlaffiliation{msrp}{This work is done when the first author is at MIT Summer Research Program (MSRP)}
+
+% \icmlcorrespondingauthor{Firstname1 Lastname1}{first1.last1@xxx.edu}
+\icmlcorrespondingauthor{Connor W. Coley}{ccoley@mit.edu}
+
+% You may provide any keywords that you
+% find helpful for describing your paper; these are used to populate
+% the "keywords" metadata in the PDF but will not be shown in the document
+%\icmlkeywords{Machine Learning, ICML}
+
+\vskip 0.3in
+]
+
+% this must go after the closing bracket ] following \twocolumn[ ...
+
+% This command actually creates the footnote in the first column
+% listing the affiliations and the copyright notice.
+% The command takes one argument, which is text to display at the start of the footnote.
+% The \icmlEqualContribution command is standard text for equal contribution.
+% Remove it (just {}) if you do not need this facility.
+
+% \printAffiliationsAndNotice{\textsuperscript{\dag}Massachusetts Institute of Technology, Cambridge, MA, United States \textsuperscript{\ddag}Texas A\&M University, College Station, TX, United States \textsuperscript{*}This work was done when Montgomery Bohde was at MIT Summer Research Program (MSRP)}  % leave blank if no need to mention equal contribution
+\printAffiliationsAndNotice{} % otherwise use the standard text.
+
+\begin{abstract}
+Mass spectrometry plays a fundamental role in elucidating the structures of unknown molecules and subsequent scientific discoveries. One formulation of the structure elucidation task is the conditional \emph{de novo} generation of molecular structure given a mass spectrum. Toward a more accurate and efficient scientific discovery pipeline for small molecules, we present DiffMS, a formula-restricted encoder-decoder generative network that achieves state-of-the-art performance on this task. The encoder utilizes a transformer architecture and models mass spectra domain knowledge such as peak formulae and neutral losses, and the decoder is a discrete graph diffusion model restricted by the heavy-atom composition of a known chemical formula. To develop a robust decoder that bridges latent embeddings and molecular structures, we pretrain the diffusion decoder with fingerprint-structure pairs, which are available in virtually infinite quantities, compared to structure-spectrum pairs that number in the tens of thousands. %mass spectra datasets. 
+Extensive experiments on established benchmarks show that DiffMS outperforms existing models on \emph{de novo} molecule generation. We provide several ablations to demonstrate the effectiveness of our diffusion and pretraining approaches and show consistent performance scaling with increasing pretraining dataset size. DiffMS code is publicly available at \url{https://github.com/coleygroup/DiffMS}.
+\end{abstract}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{figures/leu-ile.pdf}
+    \vspace{-20pt}
+    \caption{\textit{De novo} structure generation from LC-MS/MS faces ambiguity when isobaric or isomeric compounds yield similar fragmentation spectra. In this case, the experimental spectra for leucine and isoleucine from \citet{nist_database} are essentially indistinguishable. It is one of many examples demonstrating that the identification of the exact structure is desirable but challenging. %From an application perspective, generating similar but not exact structures is also beneficial to domain experts to quickly narrow down the chemical space.
+    }
+    \label{fig:leu-ile}
+\end{figure}
+
+
+\begin{figure*}[tb!]
+    \centering
+    \includegraphics[width=\linewidth]{figures/task_overview.pdf}
+    \caption{DiffMS tackles \textit{de novo} molecular generation from mass spectra. We embed mass spectrum features with a transformer encoder, and assume the chemical formula is determined by off-the-shelf tools~\citep{goldman2023mist-cf,bocker2016fragmentation} so that the numbers and types of heavy atoms (i.e.\ nodes in the molecular graph) is constrained. The molecular structure is represented as an adjacency matrix with one-hot encoded bond types, which in this example are single (blue), double (yellow), aromatic bonds (red) and no bond (white). The target molecular structure is generated starting from a randomly initialized adjacency matrix, which is denoised through a discrete diffusion process~\citep{vignac2023digress}. The trajectory used for training is created by randomly disturbing the true structure $t$ times.}
+    \label{fig:task_overview}
+\end{figure*}
+
+\section{Introduction}
+\label{intro}
+
+% importance of MS
+Mass spectrometry (MS) is a fundamental part of the analytical chemistry toolkit that can assist in the identification of unknown compounds of interest collected from experiments. Tandem mass spectrometry (MS/MS) in combination with liquid chromatography (LC) enables information-rich, high-throughput profiling of compounds, wherein complex experimental mixtures are separated in two dimensions, first by retention time (from chromatography) and then by molecule m/z (mass-to-charge ratio) in the first MS (MS1) stage. 
+Each ``precursor'' molecule is then individually passed through the second MS stage (MS2) where it undergoes collision-induced dissociation and is split into a set of charged molecular fragments, each with a corresponding m/z and an intensity. 
+Modern LC-MS/MS has enabled the discovery of many new compounds of interest, such as identifying novel bile acids in microbiome study~\citep{quinn2020global}, uncovering a tire rubber-derived chemical that is toxic to coho salmon~\citep{tian2021ubiquitous}. There is also a growing interest in increased throughput with MS technologies, such as a high-throughput analysis of chemical reactions~\citep{hu2024continuous} and a systematic discovery pipeline for human metabolites~\citep{gentry2024reverse}.
+
+% A mass spectrometer takes purified molecules\footnote{The input sample is usually a mixture of unknowns. In most cases, each unique substance will be separated by chromatography retention time and m/z separation in MS1, before being fragmented in MS2.} and breaks them into small ionized fragments, which are further detected as peaks at different mass over charge (m/z) values with different intensities. A mass spectrum contains rich information on the substructures of the molecule thus being a powerful tool in identifying unknown compounds.
+
+% existing methods for mass spec
+From MS1 and MS2 data alone, elucidation of the chemical structure(s) present in the original experimental sample remains %has historically been 
+challenging. Many yet-to-be-discovered metabolites have structures that do not exist in standard virtual chemical libraries (PubChem, Human Metabolome Database, etc.). The majority of observed spectra in MS-based metabolomics campaigns remain unidentified and are characterized as ``metabolite dark matter''~\citep{bittremieux2022critical}. The difficulty of the elucidation task comes from both computation and chemistry. In terms of computation, there is a large set of possible substructures to explain each measurement, creating an exponential number of structure candidates for the overall mass spectrum, i.e., an NP-hard combinatorial optimization. From the chemistry perspective, a standalone mass spectrum may be insufficient to determine a unique structure because of the ionization and fragmentation mechanisms of the instrument; as shown in Fig.~\ref{fig:leu-ile}, the spectra of two isomeric amino acids are nearly identical. While we would like to be able to determine the exact structure, from an application perspective, generating similar but not exactly matching structures is still useful to domain experts to narrow down the chemical space. 
+
+% in the fact that reconstructing chemical structure from a set of m/z values and peaks (as measured in MS/MS) is an NP-hard combinatorial optimization problem: for each m/z, there is a large set of possible substructures that could explain that measurement; for the overall mass spectrum, structural elucidation must solving a ``molecular jigsaw'' that assembles all such substructures. Thus, the possible combination grows exponentially with increasing molecular size or mass.
+
+% instead make clear what the two domains of problems are: forward spectra prediction and inverse structural elucidation. 
+Machine learning methods have recently taken root in this space to address two key challenges in particular: 1) to learn how to fragment a given molecule, and predict the resultant mass spectrum, known as ``forward'' MS simulation ~\citep{murphy2023efficiently,goldman2023scarf,goldman2024iceberg,young2024fragnnet,young2024massformer,nowatzky2024fiora} and 2) to take an experimental spectrum and predict the corresponding structure or a description thereof, typically as a fingerprint, SMILES, or graph representation, known as ``inverse'' methods~\citep{duhrkop2015csifingerid,stravs2022msnovelist, butler2023ms2mol,litsa2023spec2mol,goldman2023mist}. %, sometimes also described as \emph{de novo} generation or structural elucidation. 
+
+%Alongside the computational challenge for traditional MS algorithms, machine learning plays an important role in MS-related problems, including forward MS models that learn how to break a given molecule and predict the spectrum~\citep{allen2015cfm-id,wang2021cfm-id4,goldman2023scarf,goldman2024iceberg}, and inverse MS models that take the spectrum as input and predict fingerprints or structures for the target molecule~\citep{duhrkop2015csifingerid,stravs2022msnovelist, butler2023ms2mol,litsa2023spec2mol,goldman2023mist}.
+
+% Non-trivial for ML to tackle: instead of calling this task "de novo generation", call it "mol generation conditioned on mass spec"
+
+
+In this paper, we focus on the ``inverse'' MS problem and develop a novel machine learning framework for chemical structure generation given a mass spectrum, sometimes also described as \emph{de novo} generation. 
+%Despite the encouraging results in solving certain NP-hard combinatorial optimization problems by deep learning~\citep{bengio2021machine,khalil2017learning,wang2024learning,li2024distribution}, molecular generation from MS has remained a challenging task---a
+A recent study of \emph{de novo} generation from MS shows that all of the methods tested suffer from near-zero structural accuracy~\citep{bushuiev2024massspecgymbenchmarkdiscoveryidentification}. 
+% Current methods choose to utilize fingerprints as an intermediate representation, either focusing on spectrum-to-fingerprint generation~\citep{duhrkop2015csifingerid,goldman2023mist} or fingerprint-to-structure~\citep{stravs2022msnovelist,le2020neuraldecipher} tasks, rather than an end-to-end approach that utilizes spectrum-structure pairs for training. 
+Among prior approaches to this task are language models that are trained to convert tokenized m/z values and intensities as inputs to SMILES strings as outputs~\citep{butler2023ms2mol,litsa2023spec2mol}; however, these autoregressive language models do not capture the permutation-invariant nature of mass spectra and molecules, nor do they incorporate chemical formula constraints as helpful prior knowledge. 
+Another family of approaches utilizes intermediate representations such as scaffolds~\citep{wang2025madgenmassspecattendsnovo} or fingerprints~\citep{stravs2022msnovelist} before generating chemical structures, which are arguably more chemically interpretable and leverage additional amounts of structure-only data available, %, while potentially inferior design choices 
+but have not necessarily led to significant performance improvement on benchmarks.
+Compared to the complete structural elucidation challenge of the ``inverse'' MS problem, 
+the chemical formula of the unknown molecule is usually easier to determine by off-the-shelf tools from MS1 and MS2 data, utilizing tools such as SIRIUS \cite{bocker2016fragmentation}, BUDDY~\cite{Xing2023-buddy}, or MIST-CF \cite{goldman2023mist-cf}. 
+One insight of our work is to use those available tools by taking the chemical formula as given and developing a formula-constrained (i.e., heavy atom-constrained) generation pipeline. % and we develop a diffusion generation pipeline with constrained heavy atoms. 
+We also find it beneficial to exploit intermediate chemical representations to enable a scaled-up pretraining stage with theoretically unlimited fingerprint-structure pairs. 
+
+% Existing successful efforts in inverse models with traditional machine learning~\citep{duhrkop2015csifingerid} and deep learning~\citep{goldman2023mist} are mainly focused on the spectrum-to-fingerprint task. It usually requires to query from an existing library to close the gap between fingerprint and structure, limiting the application scope of these inverse models in scenarios where the target molecule is novel and does not exist in any libraries. 
+
+%Besides, \emph{de novo} molecular generation is also non-trivial as \citet{le2020neuraldecipher} demonstrate that state-of-the-art reverse-engineering from molecular fingerprint to structure has an unsatisfactory successful rate of less than 50\%. 
+
+% This is the new method & new dataset & benchmark
+%\textbf{\underline{MagicMs}}: \textbf{\underline M}olecular \textbf{\underline A}ssembly via \textbf{\underline G}eneration and \textbf{\underline I}nference \textbf{\underline C}onditioned on \textbf{\underline M}ass \textbf{\underline S}pectrum for \emph{de novo} generation from mass spectra. 
+To this end, we present \ours, a permutation-invariant diffusion model trained end-to-end for molecule generation conditioned on mass spectra (Fig.~\ref{fig:task_overview}).
+\ours has an encoder-decoder architecture that builds upon modern transformers~\citep{vaswani2017attention} and discrete graph diffusion~\citep{vignac2023digress}. 
+For the encoder, we adopt the formula transformer from MIST~\citep{goldman2023mist} with pairwise modeling of neutral losses as a domain-informed inductive bias. 
+For the decoder, we build upon the DiGress graph diffusion model~\citep{vignac2023digress} using chemical formula constraints and embeddings extracted from the formula transformer as the condition to generate target molecules. 
+% To address the challenge of molecule generation from strong structural conditions~\citep{le2020neuraldecipher}, in which the limited quantity of annotated spectrum-structure pairs has hindered generator training, we choose molecular fingerprints as the initial embedding and pretrain our decoder on a dataset of fingerprint-structure pairs sampled from DSSTox \cite{CCTE2019}, HMDB \cite{hmdb}, COCONUT \cite{Sorokina_Merseburger_Rajan_Yirik_Steinbeck_2021}, and MOSES \cite{polykovskiy2020molecularsetsmosesbenchmarking} datasets. 
+We provide empirical validation of our end-to-end model on established mass spectra \emph{de novo} generation benchmarks~\citep{duhrkop2021canopus, bushuiev2024massspecgymbenchmarkdiscoveryidentification}. Additional ablation studies demonstrate the effectiveness of our pretraining-finetuning framework. 
+
+Our contributions are summarized as follows:
+\begin{enumerate}
+    \item We present \ours, the first conditional molecular generator with formula constraints for structural elucidation from mass spectra. We demonstrate discrete diffusion as a natural methodology for conditional molecular generation that natively handles predefined heavy-atom composition and accounts for the underspecification of conditioning (i.e., the one-to-many mapping from spectrum to structure illustrated by Fig.~\ref{fig:leu-ile}). 
+    %, as the condition (either spectrum or fingerprint) not necessarily determine a unique structure. Our discrete diffusion framework also natively handles chemical formula constraints.    
+    % an encoder-decoder diffusion model that performs conditional molecular generation from mass spectra. The encoder builds on a domain-inspired transformer architecture to encode peak formulae and intensities into embeddings, and the decoder is a formula-constrained diffusion model that generates candidate molecules conditioned on spectra embeddings. To our knowledge, this is a crucial inductive bias in mass spectra as demonstrated in our experiments.
+    
+    \item We propose a pretraining-finetuning framework for training \ours that makes use of virtual chemical libraries with self-labeled structural conditions. %exploits available information for molecule generation with structural conditions.
+    % , and ensures the model learns physically meaningful intermediate representations. 
+    Specifically, the diffusion decoder is trained on a large-scale dataset with 2.8M fingerprint-structure pairs. Our ablation studies show that downstream performance scales well with increasing fingerprint-structure pretraining dataset size, providing a promising avenue to scale the performance. % not only for \emph{de novo} generation from MS, but also for general molecular machine learning tasks with structural priors. 
+    We also pretrain the spectrum encoder to predict fingerprints from spectra embeddings to further boost performance of the end-to-end finetuned model. 
+    
+    % We first train the decoder diffusion network on a larger-scale dataset of fingerprint-structure pairs. We then pretrain the encoder network to predict molecular fingerprints from mass spectra. Finally, we finetune the combined encoder-decoder model to do end-to-end spectra-conditioned molecule generation on the smaller-scale spectrum and structure pair datasets.
+    
+    \item On established benchmarks for \emph{de novo} structure elucidation, \ours demonstrates superior performance compared to all existing baselines, achieving improved annotation accuracy and better structural similarity to the true molecule. While \emph{de novo} generation of the exact molecular structure remains challenging, structurally close matches can offer valuable insights for domain experts~\citep{butler2023ms2mol}. The broad applicability of MS underscores the potential impact of \ours in advancing research in chemical and biological discovery. %\ours code will be made publicly available alongside camera ready version.   
+    
+    % We additionally provide several ablation studies that demonstrate the effectiveness of our pretraining-finetuning approach and show that downstream performance scales well with increasing fingerprint-structure pretraining dataset size, providing a promising avenue to scale the performance of our approach. 
+    
+    % \item The broad applicability of mass spectrum underlines the potential impact of DiffMS in chemistry and biology. While \emph{de novo} generation remains non-trivial, our model provides structural hints for domain experts. Source code with our decoder pretraining dataset, training, evaluation scripts of \ours, and all baselines will be made publicly available.
+
+\end{enumerate}
+
+\section{Background and Related Work}
+
+\subsection{Conditional generative molecular design}
+% Broader category. Many generative models to discuss. Also NeuralDecipher. Mention that our formula-conditioning is unique
+
+%unconditional generation
+Unconditional molecular generation has been well-explored in the context of AI for chemistry~\citep{zhang2023artificial}, with methods such as \citet{gomez2018automatic,segler2018generating} leveraging autoregressive sampling with language decoders to generate SMILES representations of molecules as well as GNN architectures that generate molecular graphs atom-by-atom for either 2-dimensional~\citep{liu2018constrained,li2018learning,simonovsky2018graphvae} or 3-dimensional~\citep{flam2022scalable,adams2022equivariant,luo2022autoregressive,liu2022generating3dmoleculestarget} graphs. Recently, \citet{vignac2023digress} developed DiGress, a non-autoregressive generative model based on discrete graph diffusion. The target spaces of these generative models are generally unconditioned or loosely conditioned, for example, to generate drug-like molecules~\citep{luo20213d} or molecules with certain conformations~\citep{roney2022generating}.
+
+%conditional gen: fp-to-mol
+In the context of \textit{de novo} structural generation, however, molecular generation must be strongly conditioned on the spectral information, i.e., the fragmentation pattern itself and an inferred chemical formula. There are some efforts that try to generate structures from molecular fingerprints, which is another form of strong structural condition, including Neuraldecipher~\citep{le2020neuraldecipher} that learns how to decode SMILES strings from molecular fingerprints, as well as MSNovelist~\citep{stravs2022msnovelist}, which proposes a fingerprint-to-SMILES long short-term memory (LSTM) network. 
+% However, these methodologies still fall short in their performance in generating molecules with strong structural conditions, whereby NeuralDecipher reports an unsatisfactory successful rate of less than 50\%.
+
+Both of these methods use autoregressive models that cannot strictly enforce formula constraints, while in MS, the chemical formula of the target molecule is an important inductive bias that limits the target space. In this paper, we identify discrete graph diffusion as a natural choice to incorporate formula constraints and improve \citet{vignac2023digress}, expanding the suite of methods in conditional molecular generation.
+
+
+\subsection{Inverse models for structure elucidation from spectra}
+% Mention DENDRAL. FP prediction. Autoregressive conditional SMILES generation. 
+
+% Q: Does IBM have any published work in this space yet? I feel like they've done conditional generation with transformers for IR or NMR or things of that sort. It's relevant enough
+Inverse models take an experimental spectrum as input and predict a relevant representation of the structure: typically, the molecular graph itself, a SMILES string, or a molecular fingerprint. 
+DENDRAL, arguably the first expert system that applied AI to science, focuses on structural elucidation from mass spectrometry data~\citep{lindsay1980dendral}. 
+Recent years have seen the adoption of machine learning for a new class of inverse MS models, such as for spectrum-to-fingerprint predictions, involving either support vector machines, as in CSI:FingerID~\citep{duhrkop2015csifingerid}; or deep learning with transformers, as in MIST~\citep{goldman2023mist}. The fingerprint, which is a binary encoding of the structure, can be further used to rank candidate structures from a chemical library. Similar elucidation goals have been pursued with other types of analytical spectra such as nuclear magnetic resonance (NMR)~\citep{alberts2023learning}. 
+
+However, the elucidation of structures that do not necessarily exist in any virtual chemical library requires generative techniques rather than retrieval-based techniques. MSNovelist~\citep{stravs2022msnovelist} builds an autoregressive fingerprint-to-molecule model that takes fingerprint predictions returned by CSI-FingerID and generates SMILES strings, with a decoding process that utilizes the molecular formula of the candidate compound as inferred from tools such as SIRIUS\cite{bocker2016fragmentation} or MIST-CF \cite{goldman2023mist-cf}. %MSNovelist is a two-stage model that utilized CSI:FingerID for stage one fingerprint prediction. 
+Spec2Mol~\citep{litsa2023spec2mol} develops a SMILES autoencoder and trains a spectrum CNN encoder model, with up to four spectral channels to accept spectra collected in low or high energy and positive or negative mode, that tries to predict the corresponding SMILES embedding from the spectrum. % align the spectral and structure embeddings.
+MassGenie~\citep{shrivastava2021massgenie} is an orthogonal effort that uses forward MS models~\citep{allen2015cfm-id,goldman2024iceberg} to augment training datasets with \emph{in silico} reference spectra.
+Toward an end-to-end pipeline for molecular generation from mass spectra, which is the most relevant to our work, \citet{butler2023ms2mol} build MS2Mol, an end-to-end language model that encodes m/z values and intensities as tokenized text input and outputs an inferred chemical formula and SMILES string in an autoregressive manner. However, their implementation is not currently available at the time of writing, preventing direct comparison. Most recently, MADGEN~\citep{wang2025madgenmassspecattendsnovo} presents a diffusion generator of chemical structures from scaffolds as a two-stage generative process, seemingly bottlenecked in terms of accuracy by scaffold prediction. 
+% Explicit incorporation of the chemical formula enables MS2Mol to optionally condition the output on chemical formula by supplying the chemical formula. 
+In this paper, we improve upon this thread of end-to-end approaches by encoding inductive biases via spectral transformers and utilizing a pretraining-finetuning framework for an MS-conditioned diffusion generator. \ours has two stages like MADGEN, but is trained end-to-end during its final training step, and is heavy-atom constrained.
+
+%However, it does not encode chemical knowledge by peak formulae and the autoregressive model loses the permutation invariance which is crucial for learning on both MS and molecules, leading to inferior performance.
+
+
+% IBM NMR~\citep{alberts2023learning}
+
+% other methods: Spec2Mol, MSNovelist, MS2Mol
+% also.. MIST?
+% also MassGenie, mostly in silico trained data though?
+
+\begin{figure*}
+    \centering
+    \includegraphics[width=\linewidth]{figures/model_overview.pdf}
+    \caption{Model architecture of \ours. \textbf{A)}~The spectrum encoder first assigns chemical formulae to peaks in an experimental spectrum and then learns an embedding vector through a formula transformer. The encoder is pretrained to predict Morgan fingerprints~\citep{morgan1965generation} from spectra. \textbf{B)}~The graph decoder generates the target adjacency matrix by discrete diffusion conditioned on the spectrum embedding and node (atom) features. The graph decoder is pretrained with pairs of structures and fingerprints from virtual chemical libraries. We scale up the decoder pretraining to exploit the virtually-infinite number of available fingerprint-structure pairs relative to the small number of available spectrum-structure pairs, mitigating the challenge of fingerprint-to-molecule generation found non-trivial by \citet{le2020neuraldecipher}. \textbf{C)}~\ours integrates the spectrum encoder and graph decoder to generate the structure annotation as a denoising process applied to a graph with randomly generated edges. It is finetuned end-to-end on labeled molecule-spectrum data.} %\textit{de novo} molecule generation conditioned on spectra.}
+    \label{fig:model-overview}
+\end{figure*}
+
+%also other conditional diffusion models (e.g. RFDiffusion, but I don't know if that's too far off?)
+
+
+\subsection{Diffusion generative models}
+Denoising diffusion ~\citep{pmlr-v37-sohl-dickstein15, ho2020denoisingdiffusionprobabilisticmodels} has been shown to be widely effective across many tasks such as image \citep{song2020score, saharia2022photorealistic, karras2022elucidating} and text \citep{li2022diffusion, austin2023structureddenoisingdiffusionmodels} generation. More recently, diffusion has been applied to solve (bio)molecular generative tasks 
+\citep{corso2023diffdockdiffusionstepstwists, Watson2023DeND, zeni2024mattergengenerativemodelinorganic}. 
+
+Broadly speaking, diffusion models are generative models defined by a forward process that progressively adds noise to a sample $\bm{z}$ from data distribution $q(\bm{z}^0)$ such that $q(\bm{z}^T | \bm{z}^0)$ converges to a known prior distribution $p(\bm{z}^T)$ as $T \to \infty$. We additionally require that the noising process be Markovian such that $q(\bm{z}^1, \dots, \bm{z}^T | \bm{z}^0) = \prod_{t=1}^Tq(\bm{z}^t | \bm{z}^{t-1})$. Finally, we select the forward process such that we can efficiently sample from $q(\bm{z}^t | \bm{z}^0)$.
+
+A neural network is then trained to reverse this noising process. However, instead of predicting $p_{\theta}(\bm{z}^{t-1} | \bm{z}^t)$, as long as $p_{\theta}(\bm{z}^{t-1} | \bm{z}^t) = \int q(\bm{z}^{t-1} | \bm{z}^t, \bm{z}^0)dp_{\theta}(\bm{z}^0)$ is tractable, we can train the model to directly predict the denoised sample $p_{\theta}(\bm{z}^0 | \bm{z}^t)$. To generate new samples from the model, we sample random noise from the prior distribution $p(\bm{z}^T)$, and iteratively sample from $p_{\theta}(\bm{z}^{t-1} | \bm{z}^t)$ until reaching $\bm{z}^0$.
+
+Many works have also studied conditional generation with diffusion. Conditional diffusion models typically fall into two categories: classifier guidance \citep{dhariwal2021diffusion} and classifier-free guidance \citep{ho2022classifier}. Classifier guidance uses the gradients of the log likelihood of a classifier function $p_{\phi}(y | \bm{z}^t)$ to guide the diffusion towards samples with class $y$. On the other hand, classifier-free guidance trains the denoising network directly to generate samples conditioned on class $y$ and does not require any external classifier function. \ours falls under classifier-free guidance.   
+
+While diffusion models were originally designed to operate in continuous spaces, recent works have adapted denoising diffusion for discrete data modalities ~\citep{austin2023structureddenoisingdiffusionmodels, lou2024discretediffusionmodelingestimating} and graph structured data ~\citep{vignac2023digress, chen2023efficientdegreeguidedgraphgeneration}, both of which are relevant for molecule generation. Here, we follow the discrete diffusion settings of ~\citet{austin2023structureddenoisingdiffusionmodels} and \citet{vignac2023digress}.
+
+\section{Methodology}
+
+\subsection{Formula-constrained molecular generation}
+% don't mention DiGress explicitly; introduce and discuss DiGress in related works
+
+%Structural Elcudiation Problem Definition
+
+We represent structure-spectrum pairs as $\left(\mathcal{M}, \mathcal{S}\right)$, where $\mathcal{M}$ is the graph representation of the molecule with corresponding spectrum $\mathcal{S}$. The goal of \textit{de novo} generation is to reconstruct the molecular graph $\widehat{\mathcal{M}}$ from $\mathcal{S}$. Because the molecular structure is typically underspecified given the spectrum, it is more natural to formulate \textit{de novo} generation as predicting a ranked list of $k$ molecules $\widehat{\bm{\mathcal{M}}_k} = (\widehat{\mathcal{M}}_1, \dots, \widehat{\mathcal{M}}_k)$ that most closely match the given spectra.
+
+%Formula Restrictions:
+
+One insight in this work is that chemical formulae represent an important physical prior that can significantly reduce the molecular search space. Formulae can be inferred from high-resolution MS1 data and isotopic traces with sufficient accuracy using tools like SIRIUS~\citep{bocker2016fragmentation} or MIST-CF~\citep{goldman2023mist-cf}, though the latter does not consider isotope distributions. To that end, we develop a formula-restricted generation using graph diffusion.  In practice, we find it sufficient to model only the heavy-atoms in the graph and infer hydrogen atom placement implicitly; thus \ours generated molecules may differ in formula from the true molecule in hydrogen atom count. 
+
+%Expand on problem definition and how+why we formulate MS structural elucidation as a generative/diffusion problem
+
+%One setting of relevance to mass spectrometry where formula is known and serves as a guidance. This information comes from high-resolution MS1 data and isotopic traces and is sufficiently robust using tools like SIRIUS or MIST-CF, though the latter does not consider isotope distributions.
+
+%Structure elucidation is a process of inference from analytical data as well, which we can generalize as a conditional generation problem. Express conditional information as some $\mathbf{y}$ which may contain information about properties of the molecule.
+
+\subsection{\ours discrete diffusion}
+
+Let a molecular graph $\mathcal{M} = \left(\mathbf{A}, \mathbf{X}, \mathbf{y}\right)$ with one-hot encoded adjacency matrix %$\mathbf{A} \in \mathbb{R}^{n \times n \times k}$
+$\mathbf{A} \in \{0,1\}^{n \times n \times k}$
+, node features $\mathbf{X}\in \mathbb{R}^{n \times d}$ such as atom types, and graph-level structural features $\mathbf{y} \in \mathbb{R}^c$ to condition the molecule generation such as molecular fingerprint or mass spectra. Here, $n$ is the number of heavy atoms in the molecule; $k = 5$, the number of bond types (no bond, single, double, triple, and aromatic bonds); $d$, the dimension of atom features; and $c$, the dimension of the conditional features. Because we obtain atom types from the formula, we can fix $\mathbf{X}$ and generate the adjacency matrix $\mathbf{A}$ conditioned on $\mathbf{X}$ and $\mathbf{y}$.
+
+We define a discrete diffusion process on $\mathbf{A}$. Let $\mathbf{A}^t$ denote the value of $\mathbf{A}$ at time $t$. Let $\mathbf{A}^0 = \mathbf{A}$, the true molecular adjacency matrix. At each time step, $t = 1, \dots, T$, we apply noise to each edge independently of others. Specifically, we define forward transition matrices $\left(\mathbf{Q}^1, \dots \mathbf{Q}^T\right)$ such that $\mathbf{Q}^t_{mn} = q\left(a^t = n | a^{t-1} = m \right)$. Thus:
+\begin{equation}
+q(\mathbf{A}^t | \mathbf{A}^{t-1}) = \mathbf{A}^{t-1}\mathbf{Q}^{t}
+\end{equation}
+Because the noise is described by a Markov transition process, we can directly sample $\mathbf{A}^t$ given $\mathbf{A}$ as:
+\begin{equation}
+q(\mathbf{A}^t | \mathbf{A}) = \mathbf{A}\mathbf{\bar{Q}}^{t}
+\end{equation}
+Where $\mathbf{\bar{Q}}^{t} = \mathbf{Q}^1\mathbf{Q}^2\dots \mathbf{Q}^t$. Because molecular graphs are undirected, we apply noise only to the upper triangle of $\mathbf{A}$ and symmetrize the matrix. We follow the noise schedule of \citet{vignac2023digress} and select
+
+\begin{equation}
+    \mathbf{\bar{Q}}^t = \bar{\alpha}^t\bm{I} + \bar{\beta}^t\bm{1}_k\bm{m}^\top
+\end{equation}
+
+where $\bm{m}$ is the marginal distribution of edge types in the training dataset and $\bm{m}^\top$ is the transpose of $\bm{m}$. This choice of $\mathbf{Q}^t$ converges to a prior distribution that is closer to the data than a uniform distribution over bond types, enabling easier training. We further select the cosine noise schedule proposed by \citet{nichol2021improveddenoisingdiffusionprobabilistic}:
+
+\begin{equation}
+    \bar{\alpha}^t = \cos\left(\frac{\pi(t/T + \epsilon)}{2(1+\epsilon)}\right)^2
+\end{equation}
+
+with $\bar{\beta}^t = 1 - \bar{\alpha}^t$. We then define a neural network $\phi_{\theta}$ that learns to predict the denoised adjacency matrix $\mathbf{A}^0$. Let $\mathcal{M}^t = \left(\mathbf{A}^t, \mathbf{X}, \mathbf{y}\right)$ be the noised molecule at time $t$. $\phi_{\theta}$ takes $\mathcal{M}^t$ as input and predicts probabilities $p_{\theta}(\mathbf{A}^0 |\mathcal{M}^t) = \phi_\theta(\mathcal{M}^t) \in \mathbb{R}^{n \times n \times k}$. 
+%$\hat{\mathbf{A}} = \phi_{\theta}\left(\mathcal{M}^t\right) \in \mathbb{R}^{n \times n \times k}$, 
+i.e., it learns to denoise $\mathbf{A}^t$ conditioned on $\mathbf{X}$, $\mathbf{y}$. We optimize this network using cross-entropy loss $L$ between the true adjacency matrix $\mathbf{A}$ and the predicted probabilities $\hat{\mathbf{A}} = \phi_\theta(\mathcal{M}^t)$:
+\begin{equation}
+L(\mathbf{A}, \hat{\mathbf{A}}) = \sum_{1 \leq i < j \leq n}\text{CE}\left(a_{ij}, \hat{a}_{ij}\right)
+\end{equation}
+
+To sample new graphs, we need to compute $p_{\theta}\left(\mathbf{A}^{t-1} | \mathcal{M}^t\right)$. We 
+ do so by marginalizing over the network predictions:
+
+\begin{equation}
+    p_{\theta}\left(a_{ij}^{t-1} | \mathcal{M}^t\right) = \sum_{a_k}p_{\theta}\left(a_{ij}^{t-1} | a_{ij} = a_k, \mathcal{M}^t\right)p_{\theta}(a_k)
+\end{equation}
+
+using $p_{\theta}\left(a_{ij}^{t-1} | a_{ij} = a_k, \mathcal{M}^t\right) = q\left(a_{ij}^{t-1} | a_{ij}=a_k, a_{ij}^t\right)$ if $q\left(a_{ij}^t | a_{ij}=a_k\right) > 0$, otherwise $0$. We can then generate new graphs by sampling an initial $\mathbf{A}^T \sim \bm{m}$ and iteratively sampling from $p_{\theta}\left(\mathbf{A}^{t-1} | \mathcal{M}^t\right)$ until we obtain $\mathbf{A}^0$.% \approx \mathbf{A}$. 
+
+\subsection{Model parametrization and pretraining}
+
+We use an encoder-decoder architecture to enable separate pretraining for the encoder and decoder before finetuning the end-to-end generative model. Specifically, a spectrum encoder infers  structural information from $\mathcal{S}$ and the encoder embeddings are used as the structural condition $\mathbf{y}$ for the graph diffusion decoder (Fig.~\ref{fig:model-overview}). 
+
+For the encoder module, we use the MIST formula transformer of \citet{goldman2023mist}. The encoder treats a spectrum as a set of (m/z, intensity) peaks. It embeds each peak using a predicted chemical formula assignment from SIRIUS and applies a set transformer that implicitly models pairwise neutral losses between fragments. We extract the final embedding corresponding to the precursor peak as the structural condition $\mathbf{y}$ for the diffusion decoder.  
+
+% moved up after merging Pretraining section into previous
+We pretrain our encoder on the same datasets used for finetuning (i.e., NPLIB1 (CANOPUS) or MassSpecGym) but now train the encoder to predict molecular fingerprints. We find that this pretraining enables the encoder to extract implicit structural information from the spectra and ensures that the encoder learns physically meaningful representations. We provide an ablation of the encoder pretraining in Sec. \ref{sec:ablations}.
+
+
+For the decoder network $\phi_\theta$ that predicts the denoised adjacency matrix, we use a Graph Transformer \citep{dwivedi2021generalizationtransformernetworksgraphs}. Specifically, we use separate MLPs to encode edge features $\mathbf{A}^t$, node features $\mathbf{X}$, and structural condition $\mathbf{y}$. We then apply several Graph Transformer layers before using an MLP to predict the denoised adjacency matrix $\hat{\mathbf{A}}$.
+
+% \subsection{Pretraining}
+
+% To incorporate as much chemical knowledge into \ours as possible, we separately pretrain our encoder and decoder models before finetuning both on \textit{de novo} molecule generation conditioned on spectra.
+
+
+We pretrain our diffusion decoder on a dataset of fingerprint-molecule pairs. Instead of using the spectrum encoder embeddings as the structural condition $\mathbf{y}$, we directly use the molecular fingerprint to condition the molecule generation. This is closely aligned with the mass spectra \textit{de novo} generation task, as the decoder learns to generate molecules subject to strong structural constraints. %Additionally, f
+Fingerprint-molecule datasets are essentially infinite in size, providing a promising path forward to further improve model performance by increasing the pretraining dataset size. To this end, we build a pretraining dataset consisting of 2.8M fingerprint-molecule pairs sampled from  DSSTox \citep{CCTE2019}, HMDB \citep{hmdb}, COCONUT \citep{Sorokina_Merseburger_Rajan_Yirik_Steinbeck_2021}, and MOSES \citep{polykovskiy2020molecularsetsmosesbenchmarking} datasets. Critically, we remove \emph{all} NPLIB1 and MassSpecGym test and validation molecules from our decoder pretraining dataset so that our evaluation on the end-to-end generation task represents a setting where the model is generating truly novel structures. \citet{bushuiev2024massspecgymbenchmarkdiscoveryidentification} provide their own dataset of 4M molecules, but use a different exclusion criteria to prevent data leakage. We provide an ablation and analysis of performance scaling with respect to pretraining dataset size in Sec. \ref{sec:ablations}.
+
+% CWC: Emphasize that we EXCLUDE all test molecules even during pretraining to make sure the model is generalizing to proposing structures it has never seen
+%Seperate pretraining of encoder/decoder in order to 1) enforce model states to be physically meaningful and 2) enable pretraining on fp2mol data which is essentially infinite in size. Further analysis of the benefits of 2) in \ref{sec:ablations}
+
+\begin{table*}[t]
+\caption{\textit{De novo} structural elucidation performance on NPLIB1 \citep{duhrkop2021canopus} and MassSpecGym~\citep{bushuiev2024massspecgymbenchmarkdiscoveryidentification} datasets. The best performing model for each metric is \textbf{bold} and the second best is \underline{underlined}. $\ddag$ indicates results reproduced from MassSpecGym.
+$*$ indicates our implementations of baseline approaches. Methods are approximately ordered by performance.
+}
+\vspace{-0.05in}
+\label{table:main}
+\begin{center}
+% \begin{sc}
+% \resizebox{\linewidth}{!}
+{
+\begin{tabular}{lcccccc}
+\toprule
+& \multicolumn{3}{c}{Top-1} & \multicolumn{3}{c}{Top-10} \\
+\cmidrule(lr){2-4}
+\cmidrule(lr){5-7}
+Model & Accuracy $\uparrow$ & MCES $\downarrow$ & Tanimoto $\uparrow$ & Accuracy $\uparrow$ & MCES $\downarrow$ & Tanimoto $\uparrow$ \\
+\midrule
+\midrule
+& \multicolumn{4}{c}{NPLIB1} & & \\
+\midrule
+Spec2Mol$^*$ & 0.00\% & 27.82 & 0.12 & 0.00\% & 23.13 & 0.16 \\
+MADGEN & 2.10\% & 20.56 & 0.22 & 2.39\% & 12.64 & 0.27 \\
+MIST + Neuraldecipher$^*$ & 2.32\% & \underline{12.11} & \textbf{0.35} & 6.11\% & \underline{9.91} & 0.43 \\
+MIST + MSNovelist$^*$ & \underline{5.40\%} & 14.52 & 0.34 & \underline{11.04}\% & 10.23 & \underline{0.44} \\
+DiffMS & \textbf{8.34\%} & \textbf{11.95} & \textbf{0.35} & \textbf{15.44\%} & \textbf{9.23} & \textbf{0.47} \\
+\midrule
+& \multicolumn{4}{c}{MassSpecGym} & & \\
+\midrule
+SMILES Transformer$^\ddag$ & 0.00\% &  79.39 & 0.03 & 0.00\% & 52.13 & 0.10 \\
+MIST + MSNovelist$^*$ & 0.00\% & 45.55 & 0.06 & 0.00\% & 30.13 & 0.15 \\
+SELFIES Transformer$^\ddag$ & 0.00\% & 38.88 & 0.08 & 0.00\% & 26.87 & 0.13 \\
+Spec2Mol$^*$ & 0.00\% & 37.76 & 0.12 & 0.00\% & 29.40 & 0.16\\
+MIST + Neuraldecipher$^*$ & 0.00\% & 33.19 & 0.14 & 0.00\% & 31.89 & 0.16 \\
+Random Generation$^\ddag$ & 0.00\% & \underline{21.11} & 0.08 & 0.00\% & 18.26 & 0.11 \\
+MADGEN & \underline{1.31\%} & 27.47 & \underline{0.20} & \underline{1.54}\% & \underline{16.84} & \underline{0.26} \\
+DiffMS & \textbf{2.30\%} & \textbf{18.45} & \textbf{0.28} & \textbf{4.25\%} & \textbf{14.73} & \textbf{0.39} \\
+\bottomrule
+\end{tabular}
+}
+% \end{sc}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\section{Experiments}
+\subsection{Evaluation metrics}
+We adopt the \emph{de novo} generation metrics from ~\citet{bushuiev2024massspecgymbenchmarkdiscoveryidentification}:
+\begin{itemize}[noitemsep,topsep=0pt] 
+    \item Top-$k$ accuracy: measures whether the true molecule is in the top-$k$ model predictions.
+    \item Top-$k$ maximum Tanimoto similarity: the structural similarity of the closest molecule to the true molecule in the top-$k$ predictions % using 2048-bit, radius 2 Morgan fingerprints. % for all evaluations. A Tanimoto similarity of 1 means the fingerprints are identical.
+    \item Top-$k$ minimum MCES (maximum common edge subgraph): the graph edit distance of the closest molecule to the true molecule in the top-$k$ predictions using the distance metric proposed by \citet{Kretschmer2023.03.27.534311}. % that measures the structural distance of the closest molecule in the top-$k$ predictions to the true molecule. A MCES of 0 means the molecular graphs are identical.
+\end{itemize}
+
+
+%Specifically, we measure the top-$k$ accuracy, which measures the likelihood that the true molecule is in the top-$k$ model predictions, top-$k$ Tanimoto similarity, a fingerprint-based measure of the structural similarity of the closest molecule in the top-$k$ predictions, and top-$k$ MCES \citep{Kretschmer2023.03.27.534311} a graph edit distance metric that also measures the structural similarity of the closest molecule in the top-$k$ predictions. 
+
+
+
+% moved down for formatting reasons only
+We report metrics for $k=1, 10$ with additional results in Appendix \ref{appendix:ablations}. %Since \ours outputs are not ordered, 
+To obtain a ranked list of \ours predictions, we sample 100 molecules for each spectrum, remove invalid or disconnected molecules, and identify the top-$k$ molecules based on frequency. This post-processing is also applied to baseline methods for fairest comparison.
+%Specifically, we use the "exact-match" retrieval accuracy metric, which quantifies what percentage of predictions match the ground truth structure based on InChiKey matching. This metric can be extended to a top-$k$ accuracy, by having the model produce $k$ different candidate molecules and determining whether the correct molecule appears among any of the predictions. 
+
+
+%For the fingerprint-to-structure task, 
+
+%For the structural elucidation from spectra task, we adopt the "exact-match" retrieval accuracy metric established in other structural elucidation papers, which quantifies what percentage of predictions match the ground truth structure based on InchiKey matching. This metric can be extended to a top-$k$ accuracy, by having the model produce some number $k$ of predictions and determining whether the correct molecule appears amongst any of those predictions. (how do other methods produce k predictions); we repeat $k$ rounds of inference with \ours to attain $k$ candidates. To come up with another empirically useful measure of candidate quality based on Tanimoto similarity, MS2Mol relaxes the exactness of the match to establish the ``close match" metric, which is equivalent to $> 0.65$ Tanimoto similarity. Given the real-world utility of having exact matches yielded by structural elucidation models, we focus on the exact match metric. Original comparisons intended to compare to Spec2Mol, MSNovelist, and MS2Mol; however, MSNovelist did not have a functioning codebase and MS2Mol does not currently have an open-source repository. Our attempts to replicate and train MS2Mol on the CANOPUS dataset did not achieve the same performance as reported in their preprint, likely due to the two-fold reduction in training dataset magnitude. Spec2Mol had a functional decoder but we chose to retrain the CNN encoder on the CANOPUS dataset. The original CNN architecture specified 4 channels to enable training on up to four spectra, corresponding to the cross product between (low or high collision eV) and (choice of [M+H]+ or [M+Na]+ adduct); because of the restriction this would pose for the additional adducts/diversity in eV we had, we instead ablated this channel and chose to train on all data with 1 singular channel. 
+
+
+%Exact match v. 'close match'es; as judged by Tanimoto similarity a la MS2Mol's discussion. Top-k. For DiffMS, do repeated inference to get $k>1$. Primarily focused on the exact match setting.
+
+%\begin{table*}[t]
+%\caption{Fingerprint to Molecule Performance on various datasets}
+%\label{mosesfp2mol}
+%\vskip 0.15in
+%\begin{center}
+%\begin{small}
+%\begin{sc}
+%\begin{tabular}{lcccccc}
+%\toprule
+%& \multicolumn{3}{c}{Top-1} & \multicolumn{3}{c}{Top-10} \\
+%\cmidrule(lr){2-4}
+%\cmidrule(lr){5-7}
+%Moses Dataset & Accuracy $\uparrow$ & MCES $\downarrow$ & Tanimoto $\uparrow$ & Accuracy $\uparrow$ & MCES $\downarrow$ & Tanimoto $\uparrow$ \\
+%\midrule
+%Random Chemical Generation & - & - & - & - & - & - \\
+%Neuraldecipher & - & - & - & - & - & - \\
+%DiffFP & $51.53\% \scriptstyle{{\pm1.21}}$ & $4.13 \scriptstyle{{\pm0.18}}$ & $0.7743 \scriptstyle{{\pm0.0089}}$ & $69.26\% \scriptstyle{{\pm1.11}}$ & $3.11 \scriptstyle{{\pm0.05}}$ & $0.8246 \scriptstyle{{\pm0.0026}}$ \\
+%\midrule
+%DSSTox Dataset \\
+%\midrule
+%Random Chemical Generation & - & - & - & - & - & - \\
+%Neuraldecipher & - & - & - & - & - & - \\
+%DiffFP & $43.55\% \scriptstyle{{\pm1.55}}$ & - & $0.6587 \scriptstyle{{\pm0.0110}}$ & $46.68\% \scriptstyle{{\pm1.56}}$ & - & $0.7094 \scriptstyle{{\pm0.0032}}$ \\
+%\bottomrule
+%\end{tabular}
+%\end{sc}
+%\end{small}
+%\end{center}
+%\vskip -0.1in
+%\end{table*}
+
+% \subsection{Generative structure elucidation from mass spectra}
+\subsection{Datasets and baselines}
+
+We evaluate \ours on two common open-source \textit{de novo} generation benchmark datasets, NPLIB1 \citep{Dührkop2021} and MassSpecGym \citep{bushuiev2024massspecgymbenchmarkdiscoveryidentification}. The NPLIB1 dataset is the subset of GNPS data used to train the CANOPUS tool; this term is used to disambiguate the data from the method. In order to have a fair evaluation of all methods considered, we re-implement several baseline methods to be trained only on these datasets, with modifications to the codebase if they did not have a working open-source implementation. While some papers have historically also benchmarked on the NIST20 or NIST23 datasets~\citep{nist_database}, this dataset is not publicly available without purchase of a license. %, and thus we have excluded it from our evaluation. 
+
+MSNovelist~\citep{stravs2022msnovelist} builds a fingerprint-to-SMILES LSTM decoder to predict SMILES strings from the SIRIUS-generated CSI-FingerID fingerprint. The original implementation of MSNovelist is not readily retrainable, and furthermore relies on the closed-source CSI-FingerID fingerprint. The recently developed MIST model offers an open-source replacement with reported comparative performance to CSI-FingerID~\citep{goldman2023mist}. %, a fingerprint developed with closed-source data. 
+Accordingly, we re-implement a baseline model that retains the main contributions of MSNovelist, adopting the code from \citet{Zhao2024-ew}, with a 4096-bit Morgan fingerprint spectral encoder using MIST alongside a formula-guided fingerprint-to-SMILES LSTM. %, as in the original implementation of MSNovelist. 
+This fingerprint-to-SMILES decoder is trained on the same 2.8M dataset used to pretrain our diffusion decoder; therefore, unlike the original MSNovelist implementation, both the spectral encoder and LSTM decoder \emph{never} see %trained on 
+any test structures. We use the ranking methodology from MSNovelist, wherein beam search (with a width of 100) and subsequently computed log-likelihoods are used for ranking. 
+Similarly, Spec2Mol~\citep{litsa2023spec2mol} %, which first trains a SMILES autoencoder and then a spectral encoder into the SMILES latent space, 
+was also retrained on the NPLIB1 and MassSpecGym datasets for fair evaluation, with only one spectral channel instead of four used for training, to alleviate restrictions on collision energy or adduct. The same ranking for candidate molecules as used for \ours is applied.
+
+% Spec2Mol decoding generates embeddings that decode to valid SMILES strings, with 65.9\% of all SMILES generating valid Molecules; however, none of these structures match the ground truth structure, even when we increase the number of samples to 10 from 1, indicating retrieval accuracy is 0\%. This poor performance is recapitulated on the training and validation datasets (error of 0.6 between AE and encoder embeddings - not sure if we should include). Screening these embeddings for Tanimoto similarity, we see that candidates have on average 15.6\% similarity to the ground truth structure, with the most similar candidate for any sample achieving only 29.8\% similarity, below the threshold for meaningful similarity as established in \citep{butler2023ms2mol}.
+
+We also introduce a new baseline method, MIST + Neuraldecipher, that replaces the diffusion decoder in \ours with Neuraldecipher. Neuraldecipher encodes a molecule into a CDDD representation \citep{C8SC04175J}, and uses a pretrained LSTM decoder to reconstruct the SMILES string. Similar to \ours, we pretrain the MIST encoder on spectrum-to-fingerprint predictions, and we pretrain Neuraldecipher on fingerprint-to-molecule generation. Since MIST + Neuraldecipher uses the same pretraining-finetuning approach as \ours, this new baseline additionally serves as an empirical justification for our graph diffusion decoder over an LSTM-based approach.
+
+Finally, we include a comparison to MADGEN~\citep{wang2025madgenmassspecattendsnovo}. The MADGEN$_{\text{Oracle}}$ entry in \citet{wang2025madgenmassspecattendsnovo} feeds in the ground-truth scaffold which %is a strong structural prior and 
+does not fall within the setting of complete \emph{de novo} generation, and is thus not included in our evaluation. Because MADGEN uses RDKFingerprints for evaluation, as opposed to the traditional Morgan fingerprint, we exclude their Tanimoto similarities.
+
+% RDFingerprints, a feature-based fingerprint; as all other benchmarking of Tanimoto similarity has been done on Morgan fingerprints, we have excluded 
+
+\subsection{Results}
+As seen in Table \ref{table:main}, \ours outperforms baseline methods on both datasets, including more than doubling the accuracy on MassSpecGym compared to the next best method, MADGEN. While there are several baseline methods that achieve non-zero prediction accuracy on NPLIB1, only MADGEN and \ours generate any correct structures on MassSpecGym. NPLIB1 is inherently a less challenging dataset than MassSpecGym; given the lack of a scaffold-based split, the CANOPUS test set contains many molecules that are nearly identical (Tanimoto similarity $>$ 0.85) to molecules in the train set \citep{bushuiev2024massspecgymbenchmarkdiscoveryidentification}. This also explains the competitive performance of MIST + Neuraldecipher and MIST + MSNovelist, which both benefit from their ability to pretrain on these highly similar structures and learn to generate realistic structures as SMILES strings; the MSNovelist generation even more so given its formula-aware decoder. In contrast, MassSpecGym ensures that no molecules in the test set have an MCES $<$ 10 compared to any training molecule. As such, MassSpecGym evaluation represents a more challenging and more realistic out of distribution \textit{de novo} generation setting, which illustrates the robust performance of \ours across all evaluation metrics.
+% do we need to elaborate upon the competitive performance of MSNovelist? 
+% MSNovelist is competitive on the CANOPUS dataset, outperforming many other methods in part because of its ability to take advantage of rich structure-only databases, as \ours does; and also applies a formula-guided decoding process, reducing the likelihood of yielding molecules with incorrect formula. 
+%However, it falls short on ...
+%Additionally, baseline methods such as MIST + Neuraldeciper, and MIST + MSNovelist have relatively poor accuracy compared to their performance on MCES and Tanimoto similarity, particularly on MassSpecGym. This indicates that while these models are able to generate realistic structures, their LSTM decoders are not able to incorporate spectra conditioning as well as the graph diffusion decoder of \ours. 
+Examples of \ours-generated sampled are shown in Figure~\ref{fig:example_preds_main} and Appendix \ref{appendix:molecules}. In Appendix \ref{appendix:eval}, we show that even in cases where \ours does not recover the correct structure, it is consistently able to generate ``close match`` structures that are still useful to domain experts.
+
+
+% moved down
+\begin{figure*}[h]
+\centering
+
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_positive_example_87_svg-tex.pdf}}
+
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/main_msg_pos_2_svg-tex.pdf}}
+
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/main_msg_neg_11_svg-tex.pdf}}
+
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_negative_example_3_svg-tex.pdf}}
+
+\vspace{-0.1in}
+\caption{Ground truth molecules (left column) and \ours predictions (right columns) on test samples from the MassSpecGym dataset~\citep{bushuiev2024massspecgymbenchmarkdiscoveryidentification}. Tanimoto similarity and MCES metrics listed for each top-$k$ prediction. From top to bottom, the spectra IDs are MassSpecGymID0205184, MassSpecGymID0052933, MassSpecGymID0382596, and MassSpecGymID0152454. The top two rows show cases where \ours successfully reconstructs the true molecule in the top-1 prediction. In the bottom two rows, \ours does not reconstruct the correct molecule. Additional examples can be found in Appendix \ref{appendix:molecules}.}
+\label{fig:example_preds_main}
+\end{figure*}
+
+\subsection{Pretraining Ablations} \label{sec:ablations}
+
+To highlight the performance gains from pretraining the \ours encoder and decoder, we provide several ablations. Note that comparisons in Table~\ref{table:main} to MIST + Neuraldecipher and MIST + MSNovelist already serve as empirical justification for \ours' discrete graph decoder.
+
+\begin{table}
+\renewcommand{\arraystretch}{1.1}
+\vspace{-0.2in}
+\caption{\ours performance on NPLIB1 with and without pretraining the MIST encoder on the spectrum-to-fingerprint task. The best performing model for each metric is \textbf{bold}.}
+\label{table:ablate_encoder}
+\vspace{-0.05in}
+\begin{center}
+% \begin{sc}
+\begin{tabular}{c|ccc}
+\toprule
+ % Pretrain & \multirow{2}{*}{Accuracy $\uparrow$} & \multirow{2}{*}{MCES $\downarrow$} & \multirow{2}{*}{Tanimoto $\uparrow$}\\
+ % Encoder & & & \\
+  Pretrain? & Accuracy $\uparrow$ & MCES $\downarrow$ & Tanimoto $\uparrow$ \\
+ \midrule
+ \midrule 
+\multicolumn{4}{c}{Top-1} \\
+\midrule
+\xmark & 4.36\% & 12.34 & 0.31 \\
+\cmark & \textbf{8.34\%} & \textbf{11.95} & \textbf{0.35} \\
+\midrule 
+\multicolumn{4}{c}{Top-10} \\
+\midrule
+\xmark & 11.46\% & 9.31 & 0.44\\
+\cmark & \textbf{15.44\%} & \textbf{9.23} & \textbf{0.47} \\
+\bottomrule
+\end{tabular}
+% \end{sc}
+\end{center}
+\vspace{-0.2in}
+\end{table}
+
+\begin{table*}[th!]
+\caption{DiffMS \textit{de novo} structural elucidation performance on NPLIB1 \citep{duhrkop2021canopus} and MassSpecGym~\citep{bushuiev2024massspecgymbenchmarkdiscoveryidentification} datasets using MIST-CF annotated formulae and ground truth formulae. The best performing model for each metric is \textbf{bold}.
+}
+\label{table:formula_study}
+\begin{center}
+% \begin{sc}
+% \resizebox{\linewidth}{!}
+{
+\begin{tabular}{lcccccc}
+\toprule
+& \multicolumn{3}{c}{Top-1} & \multicolumn{3}{c}{Top-10} \\
+\cmidrule(lr){2-4}
+\cmidrule(lr){5-7}
+Formulae & Accuracy $\uparrow$ & MCES $\downarrow$ & Tanimoto $\uparrow$ & Accuracy $\uparrow$ & MCES $\downarrow$ & Tanimoto $\uparrow$ \\
+\midrule
+\midrule
+& \multicolumn{4}{c}{NPLIB1} & & \\
+\midrule
+MIST-CF Formulae & 7.03\% & \textbf{11.81} & \textbf{0.36} & 14.98\% & 9.39 & \textbf{0.48} \\
+True Formulae & \textbf{8.34\%} & 11.95 & 0.35 & \textbf{15.44\%} & \textbf{9.23} & 0.47 \\
+\midrule
+& \multicolumn{4}{c}{MassSpecGym} & & \\
+\midrule
+MIST-CF Formulae & 1.86\% & \textbf{17.83} & 0.27 & 4.10\% & \textbf{13.71} & \textbf{0.40} \\
+True Formulae & \textbf{2.30\%} & 18.45 & \textbf{0.28} & \textbf{4.25\%} & 14.73 & 0.39 \\
+\bottomrule
+\end{tabular}
+}
+% \end{sc}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\textbf{Encoder Pretraining Ablation.} We train \ours without pretraining the MIST encoder on the spectra-to-fingerprint task. As demonstrated in Table \ref{table:ablate_encoder}, encoder pretraining provides significant performance gains on the NPLIB1 dataset, nearly doubling the top-1 accuracy. Additionally, we see %the largest performance gains on top-$k$ accuracy, indicating 
+that even without pretraining the encoder, \ours generates realistic, plausible structures as indicated by the MCES and Tanimoto metrics. Nonetheless, the encoder pretraining improves the ability of the decoder to condition the diffusion on the spectra and obtain an exact match.  
+
+\begin{figure}
+    \centering
+        \vspace{-0.1in}
+    \includegraphics[width=1.0\linewidth]{figures/decoder_ablate_acc.pdf}
+    \vspace{-0.25in}
+    \caption{NPLIB1 top-$k$ accuracy for \ours pretrained on increasingly large fingerprint-to-molecule datasets. Additional metrics available in Table \ref{table:ablate_decoder} in the Appendix.}
+    \label{fig:ablate_decoder}
+    \vspace{-0.1in}
+\end{figure}
+
+\textbf{Decoder Pretraining Ablation.} We train \ours with increasing decoder pretraining dataset size, starting from 0 molecules (i.e., no pretraining) up to the full pretraining dataset of 2.8M molecules. As shown in Fig.~\ref{fig:ablate_decoder}, any amount of decoder pretraining offers a significant increase in performance. Additionally, we observe good performance scaling with increasing pretraining dataset size. Since fingerprint-to-molecule datasets are essentially infinite in size, this provides an avenue to continue scaling \ours' performance by building even larger and more chemically comprehensive pretraining datasets.
+
+Additional results and figures for encoder and decoder pretraining ablations can be found in Appendix \ref{appendix:ablations}.
+
+
+
+\subsection{Formula Inference Ablation}
+\label{sec:formula_ablation}
+
+In many real-world elucidation settings, chemists may know the true chemical formula of the target compound \textit{a priori} or be able to determine the true formula using auxiliary methods. However, chemical formulae can also be predicted from the spectrum with high accuracy by out-of-the-box formula annotation tools~\citep{goldman2023mist-cf, Xing2023-buddy, bocker2016fragmentation}. In this section, we broaden the structural elucidation challenge and investigate the ability of DiffMS to rely on MIST-CF~\citep{goldman2023mist-cf} formula predictions to test its performance in settings where the true chemical formula is unknown.
+
+For each spectrum, we predict the top 5 most likely formulae using MIST-CF. We then generate candidate structures for each of the predicted formulae. To have a fair comparison, we still generate 100 total molecules, split across the 5 predicted formulae. As shown in Table~\ref{table:formula_study}, DiffMS still has strong performance even when relying on formula annotation tools to supply the formula. While the elucidation accuracy is slightly lower, the MCES and Tanimoto metrics are actually better in some cases using the MIST-CF predicted formulae. Intuitively, sampling molecules with different formulae gives us higher diversity and thus a better chance of getting a ``close'' structure.  
+
+\section{Conclusion}
+
+In this work, we propose \ours, a conditional molecule generative model with formula constraints for structural elucidation from mass spectra. We develop a pretraining-finetuning framework for separate spectra encoder and graph diffusion decoders that makes use of extensive fingerprint-molecule datasets and ensures the spectrum encoder learns to extract physically meaningful representations from mass spectra. We show that \ours achieves state-of-the-art results across common \textit{de novo} generation benchmarks, and provide several ablations to demonstrate the effectiveness of our contributions and the potential to further improve performance by scaling pretraining.   
+
+
+%Restate contribution items, esp. first(?) non-autoregressive model for structure elucidation from mass spectra. More general architecture that leverages discrete diffusion and the fact that formula guidance naturally emerge in this application setting. When there is ambiguity in formula, repeated inference is also possible to construct multiple hypothetical annotations. 
+
+%Strong empirical results. Promising foundation. Scaling using very large amounts of synthetic data possible. Extension to conditioning on other information also possible. In many metabolomics workflows, for example, other contextual information arising from genetics, etc. might exist.
+
+\section*{Acknowledgments}
+This work was partly sponsored by DSO National Laboratories in Singapore (to C.W.C.), the MIT Summer Research Program (MSRP), National Science Foundation under grant IIS-2243850 (to S.J.), and ARPA-H under grant 1AY1AX000053 (to S.J.).
+
+\section*{Impact Statement}
+The advancement of computational tools for structure elucidation will aid in the identification of unknown molecules, including metabolites as biomarkers for diagnostic applications or improving understanding of biology. There are many potential beneficial societal consequences of our work and very few potential negative ones, none of which warrant elaboration here.
+
+% Authors are \textbf{required} to include a statement of the potential 
+% broader impact of their work, including its ethical aspects and future 
+% societal consequences. This statement should be in an unnumbered 
+% section at the end of the paper (co-located with Acknowledgements -- 
+% the two may appear in either order, but both must be before References), 
+% and does not count toward the paper page limit. In many cases, where 
+% the ethical impacts and expected societal implications are those that 
+% are well established when advancing the field of Machine Learning, 
+% substantial discussion is not required, and a simple statement such 
+% as the following will suffice:
+
+% ``This paper presents work whose goal is to advance the field of 
+% Machine Learning. There are many potential societal consequences 
+% of our work, none which we feel must be specifically highlighted here.''
+
+% The above statement can be used verbatim in such cases, but we 
+% encourage authors to think about whether there is content which does 
+% warrant further discussion, as this statement will be apparent if the 
+% paper is later flagged for ethics review.
+
+
+% In the unusual situation where you want a paper to appear in the
+% references without citing it in the main text, use \nocite
+
+\bibliography{example_paper}
+\bibliographystyle{icml2025}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% APPENDIX
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\appendix
+\onecolumn
+
+\begin{table*}[t]
+\caption{Additional evaluation of molecule validity, and percentage above domain-expert-defined Tanimoto thresholds on NPLIB1 ~\citep{duhrkop2021canopus} and MassSpecGym~\citep{bushuiev2024massspecgymbenchmarkdiscoveryidentification} \textit{de novo} generation datasets. The best performing model for each metric is \textbf{bold} and the second best is \underline{underlined}. Definitions of meaningful match (Tanimoto similarity $\geq0.4$) and close match (Tanimoto similarity $\geq 0.675$) are taken from \citet{butler2023ms2mol}.
+}
+
+\label{table:addl_main}
+\begin{center}
+\begin{sc}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lccccc}
+\toprule
+& Overall & \multicolumn{2}{c}{Top-1} & \multicolumn{2}{c}{Top-10} \\
+\cmidrule(lr){2-2}
+\cmidrule(lr){3-4}
+\cmidrule(lr){5-6}
+Model & \% Valid $\uparrow$ & \% Meaningful match $\uparrow$ & \% Close match $\uparrow$  & \% Meaningful match $\uparrow$ & \% Close match $\uparrow$ \\
+\midrule
+\midrule
+& & \multicolumn{3}{c}{NPLIB1}  & \\
+\midrule
+Spec2Mol & 66.5\% & 0.00\% & 0.00\%& 0.00\%&0.00\% \\
+MIST + Neuraldecipher & 91.11\% & \underline{29.30}\% & 7.33\% & 41.39\% &  12.82\% \\
+MIST + MSNovelist  & \underline{98.60\%} & \textbf{32.90\%} &  \underline{11.78\%} &\underline{44.79\%} & \underline{19.02\%}  \\
+DiffMS  & \textbf{100.0\%} & 27.40\% & \textbf{12.83\%} & \textbf{46.45\%} & \textbf{22.04\%}  \\
+\midrule
+& & \multicolumn{3}{c}{MassSpecGym} & \\
+\midrule
+Spec2Mol & 68.5\% & 0.0\% &  0.0\% &   0.0\% &  0.0\% \\
+MIST + Neuraldecipher & 81.78\% & 0.29\% & \underline{0.01\%} & 0.39\% & \underline{0.09\%} \\
+MIST + MSNovelist & \underline{98.58\%} & \underline{0.66\%} & 0.00\% & \underline{1.92\%} & 0.00\%  \\
+
+DiffMS & \textbf{100.0\%}  & \textbf{12.41\%} & \textbf{3.78\%} & \textbf{32.47\%} & \textbf{6.73\%}  \\
+\bottomrule
+\end{tabular}
+}
+\end{sc}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\section{Experimental Details} \label{appendix:exp_details}
+
+For node features $\mathbf{X}$, we use a one-hot encoding of atom types, $\mathbf{X} \in \mathbb{R}^{n \times d}$, where $d$ is the number of different atom types in the dataset.
+
+For pretraining the decoder, we use 2048-bit Morgan fingerprints with radius 2 for the structural conditioning $\mathbf{y}\in\mathbb{R}^{2048}$. We use the same training objective as the end-to-end finetuning, i.e., minimizing the cross-entropy loss between the denoised adjacency matrix $\mathbf{\hat{A}}$ and the true adjacency matrix, $\mathbf{\hat{A}}$. We build a decoder pretraining datset consisting of 2.8M fingerprint-molecule pairs sampled from  DSSTox \citep{CCTE2019}, HMDB \citep{hmdb}, COCONUT \citep{Sorokina_Merseburger_Rajan_Yirik_Steinbeck_2021}, and MOSES \citep{polykovskiy2020molecularsetsmosesbenchmarking} datasets. We pretrain the decoder for 100 epochs using the AdamW optimizer~\citep{loshchilov2017sgdrstochasticgradientdescent} and a cosine annealing learning rate scheduler~\citep{loshchilov2019decoupledweightdecayregularization}.
+
+We pretrain the encoder on the same dataset used for finetuning (i.e. NPLIB1, MassSpecGym), which are orders of magnitude smaller than the decoder pretraining dataset. For encoder pretraining, we use the multi-objective loss settings of \citet{goldman2023mist}. We pretrain the encoder for 100 epochs using the RAdam optimizer ~\citep{liu2021varianceadaptivelearningrate}.
+
+We finetune the end-to-end model using cross-entropy loss and no auxiliary training objectives, i.e. only the denoising diffusion objective. We use the AdamW optimizer with cosine annealing learning rate schedule for finetuning. We finetune DiffMS for 50 epochs on NPLIB1 and 15 epochs on MassSpecGym.
+
+DiffMS is a relatively lightweight model, and all experiments were run on NVIDIA 2080ti GPUs with 12 GB of memory. On these GPUs, finetuning DiffMS takes 1.45 minutes per epoch on CANOPUS and 46 minutes per epoch on MassSpecGym. It takes 4 minutes on average to generate 100 samples from DiffMS.
+
+\section{Additional Results} \label{appendix:eval}
+As an addendum to the evaluations in Table~\ref{table:main}, we provide some additional metrics to further contextualize DiffMS performance. Firstly, we evaluate the percentage of model samples that correspond to valid molecules. Additionally, we adopt the domain-expert thresholds put forth by MS2Mol \citep{butler2023ms2mol}, where we evaluate whether candidate molecules were a ``meaningful'' match in structural similarity, having a Tanimoto similarity of 0.4 or greater; or a ``close match'' in structural similarity, having a Tanimoto similarity of 0.675 or greater. We omit MADGEN and the baseline methods from~\citet{bushuiev2024massspecgymbenchmarkdiscoveryidentification} as they do not report these metrics.
+
+As shown in Table~\ref{table:addl_main}, 100\% of DiffMS samples are valid molecules. This is directly enforced because of our graph-based representation. In contrast, SMILES strings generated by baseline methods may not correspond to a valid structure. We find that DiffMS consistently achieves higher meaningful and close match rates than baseline methods. Impressively, DiffMS achieves over 32 times more meaningful matches in the top-10 predictions than the next best baseline on MassSpecGym. These results show that while generating exact matches continues to be a challenging task for \textit{de novo} structural elucidation, DiffMS is able to generate meaningful structural matches at a high rate.
+
+\begin{figure}[t]
+\centering
+\subfigure{\includegraphics[width=0.49\textwidth]{figures/decoder_ablate_acc.pdf}}
+\subfigure{\includegraphics[width=0.49\textwidth]{figures/decoder_ablate_tanimoto.pdf}}
+\vspace{-0.1in}
+\caption{Annotation accuracy (left) and Tanimoto similarity (right) on the NPLIB1 dataset for \ours pretrained on increasingly large pretraining datasets.}
+\label{figure:appendix_ablate_encoder}
+\vspace{-0.2in}
+\end{figure}
+
+\begin{table*}[t]
+\caption{DiffMS performance on NPLIB1 for \ours pretrained on increasingly large fingerprint-to-molecule datasets.
+The best performing model for each metric is \textbf{bold} and second best is \underline{underlined}.}
+\label{table:ablate_decoder}
+\vskip 0.1in
+\begin{center}
+\begin{sc}
+\begin{tabular}{c|cccccc}
+\toprule
+\multirow{2}{*}{\raisebox{-0.7\height}{\shortstack{\# Pretraining \\ Structures}}} 
+& \multicolumn{3}{c}{Top-1} & \multicolumn{3}{c}{Top-10} \\
+\cmidrule(lr){2-4}
+\cmidrule(lr){5-7}
+& Accuracy $\uparrow$ & MCES $\downarrow$ & Tanimoto $\uparrow$ & Accuracy $\uparrow$ & MCES $\downarrow$ & Tanimoto $\uparrow$ \\
+\midrule
+0 & 2.22\% & 15.37 & 0.22 & 4.86\% & 12.06 & 0.34 \\
+0.2M & 3.61\% & 13.22 & 0.28 & 10.71\% & 9.85 & 0.41\\
+0.8M & 5.60\% & 13.02 & 0.30 & 12.70\% & 9.86 & 0.44 \\
+1.2M & \underline{7.22\%} & \textbf{11.63} & \underline{0.33} & \underline{14.69\%} & \textbf{9.23} & \underline{0.43} \\
+2.8M & \textbf{8.34\%} & \underline{11.95} & \textbf{0.35} & \textbf{15.44\%} & \textbf{9.23} & \textbf{0.47} \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\section{Ablations}
+\label{appendix:ablations}
+
+\subsection{Additional Pretraining Ablation Results}
+In this section, we provide additional results for the ablation studies in Sec.~\ref{sec:ablations}. Table~\ref{table:ablate_decoder} and Fig.~\ref{figure:appendix_ablate_decoder} demonstrate DiffMS' performance scaling with respect to increasingly large decoder pretraining datasets, and Fig~\ref{figure:appendix_ablate_encoder} shows the impact of pretraining the spectra encoder.
+
+\begin{figure}[h]
+\centering
+\subfigure{\includegraphics[width=0.49\textwidth]{figures/encoder_ablate_acc.pdf}}
+\subfigure{\includegraphics[width=0.49\textwidth]{figures/encoder_ablate_tanimoto.pdf}}
+\vspace{-0.1in}
+\caption{Annotation accuracy (left) and Tanimoto similarity (right) on the NPLIB1 dataset for \ours with and without encoder pretraining.}
+\label{figure:appendix_ablate_decoder}
+\end{figure}
+
+\subsection{Prior Distribution Ablations}
+In this section we provide an additional ablation study to justify the choice of the marginal prior distribution. Specifically, we compare with two alternative prior distributions: the ``empty'' distribution, consisting of no bonds, and the ``fully connected'' distribution, consisting of all single bonds. As shown in Table~\ref{table:prior_ablate}, the marginal distribution performs best, though the empty distribution is not far behind. Intuitively, the empty distribution is close to the marginal distribution as molecular graphs are typically very sparse. These results support our intuitions that having a prior distribution that is closer to the data distribution results in better performance.
+
+\begin{table*}[h]
+\caption{DiffMS performance on NPLIB1 with different prior distributions.
+The best performing model for each metric is \textbf{bold} and second best is \underline{underlined}.}
+\label{table:prior_ablate}
+\vskip 0.1in
+\begin{center}
+\begin{sc}
+\begin{tabular}{c|cccccc}
+\toprule
+\multirow{2}{*}{\raisebox{-0.7\height}{\shortstack{Prior Distribution}}} 
+& \multicolumn{3}{c}{Top-1} & \multicolumn{3}{c}{Top-10} \\
+\cmidrule(lr){2-4}
+\cmidrule(lr){5-7}
+& Accuracy $\uparrow$ & MCES $\downarrow$ & Tanimoto $\uparrow$ & Accuracy $\uparrow$ & MCES $\downarrow$ & Tanimoto $\uparrow$ \\
+\midrule
+Fully Connected & 3.36\% & 12.67 & 0.28 & 7.60\% & 9.56 & 0.4 \\
+Empty & \underline{6.60\%} & \textbf{11.55} & \underline{0.34} & \underline{14.94\%} & \textbf{9.07} & \textbf{0.47}\\
+Marginal & \textbf{8.34\%} & \underline{11.95} & \textbf{0.35} & \textbf{15.44\%} & \underline{9.23} & \textbf{0.47} \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\section{Formulae Annotation Study}
+\label{appenfix:formula_annotation}
+
+In this section, we provide additional experiments using MIST-CF~\citep{goldman2023mist} and BUDDY~\citep{Xing2023-buddy} for formula annotation on the NPLIB1 and MassSpecGym datasets. Specifically, we use BUDDY and MIST-CF to predict the top-5 most likely formulae for each spectra in the test sets and measure the accuracy of these formula annotations. 
+
+As shown in Table~\ref{table:buddy_mistcf_acc}, MIST-CF and BUDDY both achieve good performance on NPLIB1, where MIST-CF achieves over 90\% top-5 accuracy. However, both methods struggle on MassSpecGym, underscoring the difficulty of this dataset. It is important to note that neither NPLIB1 nor MassSpecGym include MS1 data, such as precursor m/z, which can aid in deriving accurate formula annotations. As such, these formula annotation accuracies are likely lower than what could be achieved in end-to-end elucidation workflows.  
+
+
+\begin{table*}[h]
+\vspace{-0.1in}
+\caption{Formula annotation accuracy for MIST-CF~\citep{goldman2023mist-cf} and BUDDY\cite{Xing2023-buddy} on the NPLIB1~\citep{bocker2016fragmentation} and MassSpecGym~\citep{bushuiev2024massspecgymbenchmarkdiscoveryidentification} datasets. The best performing method for each metric is \textbf{bold}.}
+\label{table:buddy_mistcf_acc}
+\vskip 0.1in
+\begin{center}
+\begin{sc}
+\begin{tabular}{c|cccc}
+\toprule
+\multirow{2}{*}{\raisebox{-0.7\height}{\shortstack{Model}}} 
+& \multicolumn{2}{c}{NPLIB1} & \multicolumn{2}{c}{MassSpecGym} \\
+\cmidrule(lr){2-3}
+\cmidrule(lr){4-5}
+& Top-1 Acc. & Top-5 Acc. & Top-1 Acc. & Top-5 Acc. \\
+\midrule
+BUDDY & 78\% & 83\% & \textbf{59\%} & \textbf{71\%}\\
+MIST-CF & \textbf{84\%} & \textbf{92\%} & 48\% & 69\%\\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\clearpage
+
+\section{\ours Generated Molecules}
+\label{appendix:molecules}
+
+\subsection{NPLIB1 Molecules}
+
+\begin{figure}[h]
+\centering
+\vspace{-0.1in}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_pos_0_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_pos_1_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_pos_2_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_pos_6_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_pos_7_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_pos_8_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_pos_20_svg-tex.pdf}}
+
+\vspace{-0.1in}
+\caption{Positive (correct) test samples from the NPLIB1 dataset~\citep{duhrkop2021canopus}. Ground truth molecules (left column) and \ours predictions (right columns).}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_neg_0_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_neg_1_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_neg_110_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_neg_170_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_neg_180_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_neg_190_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/canopus_neg_210_svg-tex.pdf}}
+
+\vspace{-0.1in}
+\caption{Negative (failure) test samples from the NPLIB1 dataset~\citep{duhrkop2021canopus}. Ground truth molecules (left column) and \ours predictions (right columns).}
+\end{figure}
+
+\clearpage
+
+\subsection{MassSpecGym Molecules}
+
+\begin{figure}[H]
+\centering
+
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_pos_0_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_pos_2_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_pos_3_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_pos_5_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_pos_8_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_pos_9_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_pos_11_svg-tex.pdf}}
+
+\vspace{-0.1in}
+\caption{Positive (correct) test samples from the MassSpecGym dataset~\citep{bushuiev2024massspecgymbenchmarkdiscoveryidentification}. Ground truth molecules (left column) and \ours predictions (right columns).}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_neg_3_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_neg_11_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_neg_15_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_neg_17_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_neg_18_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_neg_19_svg-tex.pdf}}
+\subfigure{\includegraphics[width=1.0\textwidth]{svg-inkscape/msg_neg_25_svg-tex.pdf}}
+
+\vspace{-0.1in}
+\caption{Negative (failure) test samples from the MassSpecGym dataset~\citep{bushuiev2024massspecgymbenchmarkdiscoveryidentification}. Ground truth molecules (left column) and \ours predictions (right columns).}
+\end{figure}
+
+
+\end{document}
+
+
+% This document was modified from the file originally made available by
+% Pat Langley and Andrea Danyluk for ICML-2K. This version was created
+% by Iain Murray in 2018, and modified by Alexandre Bouchard in
+% 2019 and 2021 and by Csaba Szepesvari, Gang Niu and Sivan Sabato in 2022.
+% Modified again in 2023 and 2024 by Sivan Sabato and Jonathan Scarlett.
+% Previous contributors include Dan Roy, Lise Getoor and Tobias
+% Scheffer, which was slightly modified from the 2010 version by
+% Thorsten Joachims & Johannes Fuernkranz, slightly modified from the
+% 2009 version by Kiri Wagstaff and Sam Roweis's 2008 version, which is
+% slightly modified from Prasad Tadepalli's 2007 version which is a
+% lightly changed version of the previous year's version by Andrew
+% Moore, which was in turn edited from those of Kristian Kersting and
+% Codrina Lauth. Alex Smola contributed to the algorithmic style files.
