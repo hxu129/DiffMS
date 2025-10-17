@@ -226,8 +226,6 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             'num_simulation_steps': _get('num_simulation_steps', _get('num_sumulation_steps', 400)),
             'branch_k': _get('branch_k', 6),
             'c_puct': _get('c_puct', _get('c_uct', 1.0)),
-            'temp': _get('temp', 1.0),
-            'top_p': _get('top_p', 0.9),
             'time_budget_s': _get('time_budget_s', 0.0),
             'verifier_batch_size': _get('verifier_batch_size', 32),
             'return_topk': _get('return_topk', 5),

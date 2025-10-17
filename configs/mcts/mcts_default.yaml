@@ -2,8 +2,6 @@ use_mcts: true
 num_simulation_steps: 100
 branch_k: 5
 c_puct: 1.0
-temp: 1.0
-top_p: 0.9
 time_budget_s: 0.0
 verifier_batch_size: 32
 return_topk: 5
