@@ -4,6 +4,7 @@ defaults:
     - model : model_default
     - train : train_default
     - dataset : canopus
+    - optional mcts : mcts_default  # Enable MCTS-guided generation
 
 hydra:
   job:

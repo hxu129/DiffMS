@@ -19,18 +19,20 @@ from pytorch_lightning.loggers import CSVLogger, WandbLogger
 from pytorch_lightning.utilities.warnings import PossibleUserWarning
 
 from src import utils
-from src.diffusion_model_spec2mol import Spec2MolDenoisingDiffusion
 from src.diffusion.extra_features import DummyExtraFeatures, ExtraFeatures
 from src.metrics.molecular_metrics_discrete import TrainMolecularMetricsDiscrete
 from src.diffusion.extra_features_molecular import ExtraMolecularFeatures
 from src.analysis.visualization import MolecularVisualization
 from src.datasets import spec2mol_dataset
 
+# Conditional import: use MCTS version if enabled in config
+# This will be determined dynamically in the main function
+
 
 warnings.filterwarnings("ignore", category=PossibleUserWarning)
 
 # TODO: refactor how configs are resumed (need old cfg.model and cfg.train but probably not general)
-def get_resume(cfg, model_kwargs):
+def get_resume(cfg, model_kwargs, model_class):
     """ Resumes a run. It loads previous config without allowing to update keys (used for testing). """
     saved_cfg = cfg.copy()
     name = cfg.general.name + '_resume'
@@ -46,7 +48,7 @@ def get_resume(cfg, model_kwargs):
         logging.info(f"Checkpoint {resume} is a state_dict-only checkpoint")
         return None, None
     
-    model = Spec2MolDenoisingDiffusion.load_from_checkpoint(resume, **model_kwargs)
+    model = model_class.load_from_checkpoint(resume, **model_kwargs)
 
     cfg = model.cfg
     cfg.general.test_only = resume
@@ -58,7 +60,7 @@ def get_resume(cfg, model_kwargs):
     return cfg, model
 
 
-def get_resume_adaptive(cfg, model_kwargs):
+def get_resume_adaptive(cfg, model_kwargs, model_class):
     """ Resumes a run. It loads previous config but allows to make some changes (used for resuming training)."""
     saved_cfg = cfg.copy()
     # Fetch path to this file to get base path
@@ -67,7 +69,7 @@ def get_resume_adaptive(cfg, model_kwargs):
 
     resume_path = os.path.join(root_dir, cfg.general.resume)
 
-    model = Spec2MolDenoisingDiffusion.load_from_checkpoint(resume_path, **model_kwargs)
+    model = model_class.load_from_checkpoint(resume_path, **model_kwargs)
     
     new_cfg = model.cfg
 
@@ -192,6 +194,20 @@ def main(cfg: DictConfig):
     logger.addHandler(fh)
 
     logging.info(cfg)
+    
+    # Determine whether to use MCTS version
+    use_mcts = getattr(cfg, 'mcts', None) is not None and getattr(cfg.mcts, 'use_mcts', False)
+    
+    if use_mcts:
+        logging.info("=" * 80)
+        logging.info("MCTS mode enabled - using MCTS-guided generation")
+        logging.info("=" * 80)
+        from src.diffms_mcts import Spec2MolDenoisingDiffusion
+        model_class = Spec2MolDenoisingDiffusion
+    else:
+        logging.info("Standard mode - using baseline generation")
+        from src.diffusion_model_spec2mol import Spec2MolDenoisingDiffusion
+        model_class = Spec2MolDenoisingDiffusion
 
     dataset_config = cfg["dataset"]
 
@@ -221,7 +237,7 @@ def main(cfg: DictConfig):
     use_state_dict_only = False
     if cfg.general.test_only:
         # When testing, previous configuration is fully loaded
-        cfg_resume, _ = get_resume(cfg, model_kwargs)
+        cfg_resume, _ = get_resume(cfg, model_kwargs, model_class)
         if cfg_resume is None:
             # This is a state_dict-only checkpoint, we'll use load_weights instead
             use_state_dict_only = True
@@ -231,14 +247,21 @@ def main(cfg: DictConfig):
         #os.chdir(cfg.general.test_only.split('checkpoints')[0])
     elif cfg.general.resume is not None:
         # When resuming, we can override some parts of previous configuration
-        cfg, _ = get_resume_adaptive(cfg, model_kwargs)
+        cfg, _ = get_resume_adaptive(cfg, model_kwargs, model_class)
         #os.chdir(cfg.general.resume.split('checkpoints')[0])
 
     os.makedirs('preds/', exist_ok=True)
     os.makedirs('logs/', exist_ok=True)
     os.makedirs('logs/' + cfg.general.name, exist_ok=True)
 
-    model = Spec2MolDenoisingDiffusion(cfg=cfg, **model_kwargs)
+    model = model_class(cfg=cfg, **model_kwargs)
+    
+    if use_mcts:
+        logging.info(f"MCTS configuration:")
+        logging.info(f"  - num_simulation_steps: {model.mcts_config['num_simulation_steps']}")
+        logging.info(f"  - branch_k: {model.mcts_config['branch_k']}")
+        logging.info(f"  - c_puct: {model.mcts_config['c_puct']}")
+        logging.info(f"  - return_topk: {model.mcts_config['return_topk']}")
 
     callbacks = []
     callbacks.append(LearningRateMonitor(logging_interval='step'))
