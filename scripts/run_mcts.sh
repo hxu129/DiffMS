@@ -4,7 +4,6 @@ python src/spec2mol_main.py \
     general.test_only=/root/ms/DiffMS/checkpoints/diffms_canopus.ckpt \
     general.name=dev \
     general.wandb_name=test \
-    mcts.use_mcts=false \
     general.sample_every_val=1000 \
     general.test_samples_to_generate=10 \
     general.val_samples_to_generate=100 \
@@ -12,10 +11,10 @@ python src/spec2mol_main.py \
     general.gpus=1 \
     general.seed=123 \
     mcts.use_mcts=true \
-    mcts.num_simulation_steps=100 \
-    mcts.branch_k=5 \
-    mcts.c_puct=1.0 \
+    mcts.num_simulation_steps=1000 \
+    mcts.branch_k=10 \
+    mcts.c_puct=0.5 \
     mcts.time_budget_s=0.0 \
     mcts.verifier_batch_size=32 \
-    mcts.return_topk=5 \
+    mcts.return_topk=10 \
     mcts.verifier_type=iceberg \
