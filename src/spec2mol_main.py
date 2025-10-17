@@ -194,9 +194,26 @@ def main(cfg: DictConfig):
     logger.addHandler(fh)
 
     logging.info(cfg)
+
+    # Set random seeds for reproducibility
+    if hasattr(cfg.general, 'seed'):
+        import random
+        import numpy as np
+        from pytorch_lightning import seed_everything
+    
+        seed = cfg.general.seed
+        logging.info(f"=" * 80)
+        logging.info(f"Setting random seed to {seed} for reproducibility")
+        logging.info(f"=" * 80)
+    
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        seed_everything(seed, workers=True)
     
     # Determine whether to use MCTS version
-    use_mcts = getattr(cfg, 'mcts', None) is not None and getattr(cfg.mcts, 'use_mcts', False)
+    use_mcts = cfg.mcts.use_mcts
     
     if use_mcts:
         logging.info("=" * 80)

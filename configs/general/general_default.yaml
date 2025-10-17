@@ -7,6 +7,8 @@ wandb: 'online'             # online | offline | disabled
 wandb_name: 'mass_spec_exp'
 gpus: 1                     # Multi-gpu is not implemented on this branch
 
+seed: 42
+
 decoder: null # path to pretrained decoder
 encoder: null # path to pretrained encoder
 
