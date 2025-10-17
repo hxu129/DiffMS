@@ -12,12 +12,12 @@ from torch_geometric.data import Batch
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from models.transformer_model import GraphTransformer
-from diffusion.noise_schedule import DiscreteUniformTransition, PredefinedNoiseScheduleDiscrete,\
+from src.models.transformer_model import GraphTransformer
+from src.diffusion.noise_schedule import DiscreteUniformTransition, PredefinedNoiseScheduleDiscrete,\
     MarginalUniformTransition
 from src.diffusion import diffusion_utils
-from metrics.train_metrics import TrainLossDiscrete
-from metrics.abstract_metrics import SumExceptBatchMetric, SumExceptBatchKL, NLL, CrossEntropyMetric
+from src.metrics.train_metrics import TrainLossDiscrete
+from src.metrics.abstract_metrics import SumExceptBatchMetric, SumExceptBatchKL, NLL, CrossEntropyMetric
 from src.metrics.diffms_metrics import K_ACC_Collection, K_SimilarityCollection, Validity
 from src import utils
 from src.mist.models.spectra_encoder import SpectraEncoderGrowing
