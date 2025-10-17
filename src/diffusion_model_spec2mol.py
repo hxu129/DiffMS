@@ -408,9 +408,14 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         true_mols = [Chem.inchi.MolFromInchi(data.get_example(idx).inchi) for idx in range(len(data))] # Is this correct?
         predicted_mols = [list() for _ in range(len(data))]
 
-        for _ in range(self.test_num_samples):
+        if self.global_rank == 0:
+            logging.info(f"Batch {i}: Generating {self.test_num_samples} molecules for {len(data)} samples...")
+        
+        for sample_idx in range(self.test_num_samples):
             for idx, mol in enumerate(self.sample_batch(data)):
                 predicted_mols[idx].append(mol)
+            if self.global_rank == 0 and (sample_idx + 1) % 10 == 0:
+                logging.info(f"Batch {i}: Generated {sample_idx + 1}/{self.test_num_samples} molecules")
 
         with open(f"preds/{self.name}_rank_{self.global_rank}_pred_{i}.pkl", "wb") as f:
             pickle.dump(predicted_mols, f)
