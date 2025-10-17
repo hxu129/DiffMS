@@ -175,11 +175,19 @@ def compute_tanimoto_similarity(mol1, mol2):
         return 0.0
 
 
-def test_single_molecule(model, batch, true_inchi, device):
-    """Test generation for a single molecule.
+def test_batch_molecules(model, batch, true_inchis, device, num_predictions=10, top_k=5):
+    """Test generation for a batch of molecules.
+    
+    Args:
+        model: The DiffMS model
+        batch: Input batch
+        true_inchis: List of ground truth InChI strings
+        device: Device to run on
+        num_predictions: Number of predictions to generate per sample
+        top_k: Number of top predictions to consider for metrics
     
     Returns:
-        dict with keys: 'success', 'predictions', 'valid_count', 'similarities'
+        list of dicts, one for each molecule in the batch
     """
     try:
         # Move batch to device
@@ -190,12 +198,134 @@ def test_single_molecule(model, batch, true_inchi, device):
             else:
                 batch_device[k] = v
         
-        # Generate molecules
+        # Generate multiple predictions per sample
+        batch_size = len(true_inchis)
+        all_pred_mols = [[] for _ in range(batch_size)]
+        
         with torch.no_grad():
-            pred_mols, pred_smiles = model.sample_batch(
-                batch_device['graph'],
-                return_smiles=True
-            )
+            for _ in range(num_predictions):
+                pred_mols = model.sample_batch(batch_device['graph'])
+                # Distribute predictions to corresponding samples
+                for idx, mol in enumerate(pred_mols):
+                    all_pred_mols[idx].append(mol)
+        
+        # Process each molecule in the batch
+        results = []
+        
+        for i, true_inchi in enumerate(true_inchis):
+            # Get predictions for this sample
+            sample_pred_mols = all_pred_mols[i]
+            
+            # Generate SMILES from molecules
+            sample_pred_smiles = []
+            for mol in sample_pred_mols:
+                if mol is not None:
+                    try:
+                        smiles = Chem.MolToSmiles(mol)
+                        sample_pred_smiles.append(smiles)
+                    except:
+                        sample_pred_smiles.append(None)
+                else:
+                    sample_pred_smiles.append(None)
+            
+            # Get ground truth molecule
+            true_mol = Chem.inchi.MolFromInchi(true_inchi)
+            
+            # Evaluate predictions
+            valid_count = sum(1 for m in sample_pred_mols if m is not None)
+            similarities = [compute_tanimoto_similarity(m, true_mol) for m in sample_pred_mols]
+            matches = [molecules_match(m, true_mol) for m in sample_pred_mols]
+            
+            # Top-1 metrics
+            top1_match = matches[0] if len(matches) > 0 else False
+            top1_similarity = similarities[0] if len(similarities) > 0 else 0.0
+            
+            # Top-k metrics
+            topk_matches = matches[:min(top_k, len(matches))]
+            topk_match = any(topk_matches) if len(topk_matches) > 0 else False
+            topk_avg_similarity = np.mean(similarities[:min(top_k, len(similarities))]) if len(similarities) > 0 else 0.0
+            
+            # Overall metrics
+            max_similarity = max(similarities) if len(similarities) > 0 else 0.0
+            
+            results.append({
+                'success': True,
+                'predictions': sample_pred_mols,
+                'smiles': sample_pred_smiles,
+                'valid_count': valid_count,
+                'similarities': similarities,
+                'matches': matches,
+                'top1_match': top1_match,
+                'top1_similarity': top1_similarity,
+                'topk_match': topk_match,
+                'topk_avg_similarity': float(topk_avg_similarity),
+                'max_similarity': max_similarity,
+            })
+        
+        return results
+    
+    except Exception as e:
+        logger.error(f"Error during batch generation: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return error result for all samples in batch
+        return [{
+            'success': False,
+            'error': str(e),
+            'predictions': [],
+            'smiles': [],
+            'valid_count': 0,
+            'similarities': [],
+            'matches': [],
+            'top1_match': False,
+            'top1_similarity': 0.0,
+            'topk_match': False,
+            'topk_avg_similarity': 0.0,
+            'max_similarity': 0.0,
+        } for _ in true_inchis]
+
+
+def test_single_molecule(model, batch, true_inchi, device, num_predictions=10, top_k=5):
+    """Test generation for a single molecule.
+    
+    Args:
+        model: The DiffMS model
+        batch: Input batch
+        true_inchi: Ground truth InChI string
+        device: Device to run on
+        num_predictions: Number of predictions to generate
+        top_k: Number of top predictions to consider for metrics
+    
+    Returns:
+        dict with keys: 'success', 'predictions', 'valid_count', 'similarities', etc.
+    """
+    try:
+        # Move batch to device
+        batch_device = {}
+        for k, v in batch.items():
+            if hasattr(v, 'to'):
+                batch_device[k] = v.to(device)
+            else:
+                batch_device[k] = v
+        
+        # Generate multiple predictions
+        pred_mols = []
+        with torch.no_grad():
+            for _ in range(num_predictions):
+                mols = model.sample_batch(batch_device['graph'])
+                pred_mols.extend(mols)
+        
+        # Generate SMILES from molecules
+        pred_smiles = []
+        for mol in pred_mols:
+            if mol is not None:
+                try:
+                    smiles = Chem.MolToSmiles(mol)
+                    pred_smiles.append(smiles)
+                except:
+                    pred_smiles.append(None)
+            else:
+                pred_smiles.append(None)
         
         # Get ground truth molecule
         true_mol = Chem.inchi.MolFromInchi(true_inchi)
@@ -205,8 +335,16 @@ def test_single_molecule(model, batch, true_inchi, device):
         similarities = [compute_tanimoto_similarity(m, true_mol) for m in pred_mols]
         matches = [molecules_match(m, true_mol) for m in pred_mols]
         
+        # Top-1 metrics
         top1_match = matches[0] if len(matches) > 0 else False
         top1_similarity = similarities[0] if len(similarities) > 0 else 0.0
+        
+        # Top-k metrics
+        topk_matches = matches[:min(top_k, len(matches))]
+        topk_match = any(topk_matches) if len(topk_matches) > 0 else False
+        topk_avg_similarity = np.mean(similarities[:min(top_k, len(similarities))]) if len(similarities) > 0 else 0.0
+        
+        # Overall metrics
         max_similarity = max(similarities) if len(similarities) > 0 else 0.0
         
         return {
@@ -218,6 +356,8 @@ def test_single_molecule(model, batch, true_inchi, device):
             'matches': matches,
             'top1_match': top1_match,
             'top1_similarity': top1_similarity,
+            'topk_match': topk_match,
+            'topk_avg_similarity': float(topk_avg_similarity),
             'max_similarity': max_similarity,
         }
     
@@ -235,6 +375,8 @@ def test_single_molecule(model, batch, true_inchi, device):
             'matches': [],
             'top1_match': False,
             'top1_similarity': 0.0,
+            'topk_match': False,
+            'topk_avg_similarity': 0.0,
             'max_similarity': 0.0,
         }
 
@@ -245,6 +387,12 @@ def main():
                         help='Number of test samples')
     parser.add_argument('--use_mcts', action='store_true',
                         help='Enable MCTS-guided generation')
+    parser.add_argument('--batch_size', type=int, default=1,
+                        help='Batch size for processing samples (default: 1)')
+    parser.add_argument('--num_predictions', type=int, default=10,
+                        help='Number of predictions to generate per sample (default: 10)')
+    parser.add_argument('--top_k', type=int, default=5,
+                        help='Compute top-k accuracy metrics (default: 5)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     parser.add_argument('--output_dir', type=str, default='mcts_test_results',
@@ -261,6 +409,9 @@ def main():
     logger.info("=" * 80)
     logger.info(f"Mode: {'MCTS-guided' if args.use_mcts else 'Baseline'}")
     logger.info(f"Number of samples: {args.num_samples}")
+    logger.info(f"Batch size: {args.batch_size}")
+    logger.info(f"Predictions per sample: {args.num_predictions}")
+    logger.info(f"Top-k for metrics: {args.top_k}")
     logger.info(f"Random seed: {args.seed}")
     
     # Load model
@@ -281,6 +432,9 @@ def main():
         'config': {
             'use_mcts': args.use_mcts,
             'num_samples': args.num_samples,
+            'batch_size': args.batch_size,
+            'num_predictions': args.num_predictions,
+            'top_k': args.top_k,
             'seed': args.seed,
             'mcts_config': OmegaConf.to_container(cfg.mcts) if args.use_mcts else None,
         },
@@ -288,57 +442,85 @@ def main():
         'summary': {},
     }
     
-    # Test each sample
-    for i, idx in enumerate(test_indices):
+    # Process samples in batches
+    from torch_geometric.data import Batch as PyGBatch
+    
+    for batch_start in range(0, len(test_indices), args.batch_size):
+        batch_end = min(batch_start + args.batch_size, len(test_indices))
+        batch_indices = test_indices[batch_start:batch_end]
+        current_batch_size = len(batch_indices)
+        
         logger.info("")
         logger.info("=" * 80)
-        logger.info(f"Test {i+1}/{len(test_indices)} - Dataset Index: {idx}")
+        logger.info(f"Processing Batch {batch_start//args.batch_size + 1} - Samples {batch_start+1}-{batch_end}/{len(test_indices)}")
+        logger.info(f"Dataset Indices: {batch_indices}")
         logger.info("=" * 80)
         
         try:
-            # Get sample from dataset
-            sample = test_dataset[idx]
+            # Get samples from dataset
+            samples = [test_dataset[idx] for idx in batch_indices]
             
-            # Create single-sample batch
-            from torch_geometric.data import Batch as PyGBatch
-            graph_batch = PyGBatch.from_data_list([sample['graph']])
+            # Extract graphs (note: sample['graph'] is a list with one element)
+            graphs = [s['graph'][0] for s in samples]
+            
+            # Create batch
+            graph_batch = PyGBatch.from_data_list(graphs)
             batch = {'graph': graph_batch}
             
-            # Get ground truth
-            true_inchi = sample['graph'].inchi
-            logger.info(f"Ground truth InChI: {true_inchi[:80]}...")
+            # Get ground truths
+            true_inchis = [g.inchi for g in graphs]
             
             # Run generation
-            result = test_single_molecule(model, batch, true_inchi, device)
-            
-            # Log results
-            if result['success']:
-                logger.info(f"✓ Generation successful")
-                logger.info(f"  Valid predictions: {result['valid_count']}/{len(result['predictions'])}")
-                logger.info(f"  Top-1 match: {'✓ YES' if result['top1_match'] else '✗ NO'}")
-                logger.info(f"  Top-1 similarity: {result['top1_similarity']:.4f}")
-                logger.info(f"  Max similarity: {result['max_similarity']:.4f}")
-                
-                if len(result['smiles']) > 0:
-                    logger.info(f"  Top-1 SMILES: {result['smiles'][0]}")
+            if current_batch_size > 1:
+                batch_results = test_batch_molecules(model, batch, true_inchis, device, 
+                                                    num_predictions=args.num_predictions, 
+                                                    top_k=args.top_k)
             else:
-                logger.info(f"✗ Generation failed: {result.get('error', 'Unknown error')}")
+                # Use single molecule function for batch_size=1
+                single_result = test_single_molecule(model, batch, true_inchis[0], device, 
+                                                     num_predictions=args.num_predictions,
+                                                     top_k=args.top_k)
+                batch_results = [single_result]
             
-            # Store result
-            results['samples'].append({
-                'index': idx,
-                'true_inchi': true_inchi,
-                'result': result,
-            })
+            # Log and store results for each sample in batch
+            effective_k = min(args.top_k, len(batch_results[0]['predictions']) if batch_results and batch_results[0]['success'] else args.top_k)
+            
+            for i, (idx, true_inchi, result) in enumerate(zip(batch_indices, true_inchis, batch_results)):
+                logger.info(f"\n  Sample {batch_start + i + 1} (Index {idx}):")
+                logger.info(f"    Ground truth InChI: {true_inchi[:60]}...")
+                
+                if result['success']:
+                    actual_k = min(args.top_k, len(result['predictions']))
+                    logger.info(f"    ✓ Generation successful")
+                    logger.info(f"      Valid predictions: {result['valid_count']}/{len(result['predictions'])}")
+                    logger.info(f"      Top-1 match: {'✓ YES' if result['top1_match'] else '✗ NO'}")
+                    logger.info(f"      Top-1 similarity: {result['top1_similarity']:.4f}")
+                    logger.info(f"      Top-{actual_k} match: {'✓ YES' if result['topk_match'] else '✗ NO'}")
+                    logger.info(f"      Top-{actual_k} avg similarity: {result['topk_avg_similarity']:.4f}")
+                    logger.info(f"      Max similarity: {result['max_similarity']:.4f}")
+                    
+                    if len(result['smiles']) > 0:
+                        logger.info(f"      Top-1 SMILES: {result['smiles'][0]}")
+                else:
+                    logger.info(f"    ✗ Generation failed: {result.get('error', 'Unknown error')}")
+                
+                # Store result
+                results['samples'].append({
+                    'index': idx,
+                    'true_inchi': true_inchi,
+                    'result': result,
+                })
         
         except Exception as e:
-            logger.error(f"Error processing sample {idx}: {e}")
+            logger.error(f"Error processing batch: {e}")
             import traceback
             traceback.print_exc()
-            results['samples'].append({
-                'index': idx,
-                'error': str(e),
-            })
+            # Store error for all samples in this batch
+            for idx in batch_indices:
+                results['samples'].append({
+                    'index': idx,
+                    'error': str(e),
+                })
     
     # Compute summary statistics
     successful_samples = [s for s in results['samples'] if 'result' in s and s['result']['success']]
@@ -347,18 +529,28 @@ def main():
         total_predictions = sum(len(s['result']['predictions']) for s in successful_samples)
         total_valid = sum(s['result']['valid_count'] for s in successful_samples)
         top1_correct = sum(1 for s in successful_samples if s['result']['top1_match'])
+        topk_correct = sum(1 for s in successful_samples if s['result']['topk_match'])
         
         avg_top1_sim = np.mean([s['result']['top1_similarity'] for s in successful_samples])
+        avg_topk_sim = np.mean([s['result']['topk_avg_similarity'] for s in successful_samples])
         avg_max_sim = np.mean([s['result']['max_similarity'] for s in successful_samples])
+        
+        # Determine effective k (in case num_predictions < top_k)
+        effective_k = min(args.top_k, args.num_predictions)
         
         results['summary'] = {
             'num_tested': len(test_indices),
             'num_successful': len(successful_samples),
+            'num_predictions': args.num_predictions,
+            'top_k': args.top_k,
+            'effective_k': effective_k,
             'total_predictions': total_predictions,
             'total_valid': total_valid,
             'validity_rate': total_valid / total_predictions if total_predictions > 0 else 0.0,
             'top1_accuracy': top1_correct / len(successful_samples),
+            f'top{effective_k}_accuracy': topk_correct / len(successful_samples),
             'avg_top1_similarity': float(avg_top1_sim),
+            f'avg_top{effective_k}_similarity': float(avg_topk_sim),
             'avg_max_similarity': float(avg_max_sim),
         }
     else:
@@ -397,6 +589,9 @@ def main():
         f.write(f"Mode: {'MCTS-guided' if args.use_mcts else 'Baseline'}\n")
         f.write(f"Timestamp: {timestamp}\n")
         f.write(f"Number of samples: {args.num_samples}\n")
+        f.write(f"Batch size: {args.batch_size}\n")
+        f.write(f"Predictions per sample: {args.num_predictions}\n")
+        f.write(f"Top-k for metrics: {args.top_k}\n")
         f.write(f"Random seed: {args.seed}\n\n")
         f.write("Summary Statistics:\n")
         f.write("-" * 40 + "\n")
@@ -411,9 +606,12 @@ def main():
                 f.write(f"  Error: {sample['error']}\n")
             elif 'result' in sample and sample['result']['success']:
                 res = sample['result']
+                actual_k = min(args.top_k, len(res['predictions']))
                 f.write(f"  Valid: {res['valid_count']}/{len(res['predictions'])}\n")
                 f.write(f"  Top-1 match: {res['top1_match']}\n")
                 f.write(f"  Top-1 similarity: {res['top1_similarity']:.4f}\n")
+                f.write(f"  Top-{actual_k} match: {res['topk_match']}\n")
+                f.write(f"  Top-{actual_k} avg similarity: {res['topk_avg_similarity']:.4f}\n")
                 f.write(f"  Max similarity: {res['max_similarity']:.4f}\n")
     
     logger.info(f"✓ Summary saved to {summary_file}")
