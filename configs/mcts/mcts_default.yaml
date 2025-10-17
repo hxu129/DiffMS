@@ -1,0 +1,22 @@
+use_mcts: true
+num_simulation_steps: 100
+branch_k: 5
+c_puct: 1.0
+temp: 1.0
+top_p: 0.9
+time_budget_s: 0.0
+verifier_batch_size: 32
+return_topk: 5
+
+verifier_type: 'iceberg'
+
+iceberg:
+  gen_checkpoint: '/root/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_generate.ckpt'
+  inten_checkpoint: '/root/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_score.ckpt'
+
+similarity:
+  tolerance_da: 0.01
+
+bins_upper_mz: 1500.0
+bins_count: 15000
+
