@@ -39,6 +39,13 @@ def get_resume(cfg, model_kwargs):
     test_samples_to_generate = cfg.general.test_samples_to_generate
     gpus = cfg.general.gpus
 
+    # Check if checkpoint is a state_dict-only checkpoint or a full Lightning checkpoint
+    checkpoint = torch.load(resume, map_location='cpu')
+    if 'state_dict' in checkpoint and 'pytorch-lightning_version' not in checkpoint:
+        # This is a state_dict-only checkpoint, return None to signal we should use load_weights instead
+        logging.info(f"Checkpoint {resume} is a state_dict-only checkpoint")
+        return None, None
+    
     model = Spec2MolDenoisingDiffusion.load_from_checkpoint(resume, **model_kwargs)
 
     cfg = model.cfg
@@ -211,9 +218,16 @@ def main(cfg: DictConfig):
     model_kwargs = {'dataset_infos': dataset_infos, 'train_metrics': train_metrics, 'visualization_tools': visualization_tools,
                     'extra_features': extra_features, 'domain_features': domain_features}
 
+    use_state_dict_only = False
     if cfg.general.test_only:
         # When testing, previous configuration is fully loaded
-        cfg, _ = get_resume(cfg, model_kwargs)
+        cfg_resume, _ = get_resume(cfg, model_kwargs)
+        if cfg_resume is None:
+            # This is a state_dict-only checkpoint, we'll use load_weights instead
+            use_state_dict_only = True
+            logging.info(f"Using state_dict-only checkpoint: {cfg.general.test_only}")
+        else:
+            cfg = cfg_resume
         #os.chdir(cfg.general.test_only.split('checkpoints')[0])
     elif cfg.general.resume is not None:
         # When resuming, we can override some parts of previous configuration
@@ -249,8 +263,9 @@ def main(cfg: DictConfig):
 
     loggers = [
         CSVLogger(save_dir=f"logs/{name}", name=name),
-        WandbLogger(name=name, save_dir=f"logs/{name}", project=cfg.general.wandb_name, log_model=False, config=utils.cfg_to_dict(cfg))
     ]
+    if cfg.general.wandb != 'disabled':
+        loggers.append(WandbLogger(name=name, save_dir=f"logs/{name}", project=cfg.general.wandb_name, log_model=False, config=utils.cfg_to_dict(cfg)))
 
     use_gpu = cfg.general.gpus > 0 and torch.cuda.is_available()
     trainer = Trainer(gradient_clip_val=cfg.train.clip_grad,
@@ -270,6 +285,11 @@ def main(cfg: DictConfig):
     if cfg.general.load_weights is not None:
         logging.info(f"Loading weights from {cfg.general.load_weights}")
         model = load_weights(model, cfg.general.load_weights)
+    
+    # Load weights from state_dict-only checkpoint if needed
+    if use_state_dict_only:
+        logging.info(f"Loading state_dict from {cfg.general.test_only}")
+        model = load_weights(model, cfg.general.test_only)
 
     if not cfg.general.test_only:
         trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.general.resume)
@@ -277,7 +297,11 @@ def main(cfg: DictConfig):
             trainer.test(model, datamodule=datamodule, ckpt_path=cfg.general.checkpoint_strategy)
     else:
         # Start by evaluating test_only_path
-        trainer.test(model, datamodule=datamodule, ckpt_path=cfg.general.test_only)
+        if use_state_dict_only:
+            # Don't pass ckpt_path since we already loaded the weights
+            trainer.test(model, datamodule=datamodule)
+        else:
+            trainer.test(model, datamodule=datamodule, ckpt_path=cfg.general.test_only)
         if cfg.general.evaluate_all_checkpoints:
             directory = pathlib.Path(cfg.general.test_only).parents[0]
             logging.info("Directory:", directory)
