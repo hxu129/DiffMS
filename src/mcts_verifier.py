@@ -46,7 +46,7 @@ class IcebergVerifier(BaseVerifier):
         self.bins_upper_mz = float(bins_upper_mz)
         self.bins_count = int(bins_count)
 
-    def _to_matchms(self, spectra: np.ndarray, adduct: str):
+    def _to_matchms(self, spectra: np.ndarray, adduct: str, precursor_mz: float = None):
         from matchms import Spectrum
         # Accept either binned vector (len==bins_count) or raw peaks (N,2)
         arr = np.asarray(spectra)
@@ -57,7 +57,12 @@ class IcebergVerifier(BaseVerifier):
             mz, inten = arr[:, 0], arr[:, 1]
         else:
             raise ValueError("target_spectra must be 1D binned (length bins_count) or 2D (N,2) peaks array")
-        return Spectrum(mz=mz.astype(float), intensities=inten.astype(float), metadata={'adduct': adduct})
+        
+        metadata = {'adduct': adduct}
+        if precursor_mz is not None and precursor_mz > 0:
+            metadata['precursor_mz'] = float(precursor_mz)
+        
+        return Spectrum(mz=mz.astype(float), intensities=inten.astype(float), metadata=metadata)
     
     def _aggregate_fragments_to_spectrum(self, frags: dict):
         """Convert ICEBERG fragment predictions into aggregated spectrum array.
@@ -103,7 +108,7 @@ class IcebergVerifier(BaseVerifier):
             smiles_list = [smiles_list]
         
         # Build target spectrum once
-        spec_t = self._to_matchms(target_spectra, adduct)
+        spec_t = self._to_matchms(target_spectra, adduct, precursor_mz)
         
         from matchms import Spectrum
         scores = []
@@ -126,10 +131,14 @@ class IcebergVerifier(BaseVerifier):
                 
                 # Convert to matchms Spectrum
                 if pred_spectrum.shape[0] > 0:
+                    pred_metadata = {'adduct': adduct}
+                    if precursor_mz is not None and precursor_mz > 0:
+                        pred_metadata['precursor_mz'] = float(precursor_mz)
+                    
                     spec_p = Spectrum(
                         mz=pred_spectrum[:, 0].astype(float),
                         intensities=pred_spectrum[:, 1].astype(float),
-                        metadata={'adduct': adduct}
+                        metadata=pred_metadata
                     )
                     result = self.cosine.pair(spec_p, spec_t)
                     # Handle different matchms versions
