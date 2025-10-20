@@ -16,5 +16,4 @@ python src/spec2mol_main.py \
     mcts.c_puct=0.5 \
     mcts.time_budget_s=0.0 \
     mcts.verifier_batch_size=32 \
-    mcts.return_topk=10 \
     mcts.verifier_type=iceberg \

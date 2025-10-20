@@ -4,7 +4,6 @@ branch_k: 5
 c_puct: 1.0
 time_budget_s: 0.0
 verifier_batch_size: 32
-return_topk: 5
 
 verifier_type: 'iceberg'
 

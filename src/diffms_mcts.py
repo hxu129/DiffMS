@@ -225,7 +225,6 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             'c_puct': _get('c_puct', _get('c_uct', 1.0)),
             'time_budget_s': _get('time_budget_s', 0.0),
             'verifier_batch_size': _get('verifier_batch_size', 32),
-            'return_topk': _get('return_topk', 5),
         }
         # External verifier should be injected; we only call verifier.score()
         self.verifier = getattr(self, 'verifier', None)
@@ -277,7 +276,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         pred.X = dense_data.X
         pred.Y = data.y
 
-        nll = self.compute_val_loss(pred, noisy_data, dense_data.X, dense_data.E, data.y,  node_mask, test=True)
+        nll = 0.0 
 
         true_E = torch.reshape(dense_data.E, (-1, dense_data.E.size(-1)))  # (bs * n * n, de)
         masked_pred_E = torch.reshape(pred.E, (-1, pred.E.size(-1)))   # (bs * n * n, de)
@@ -296,7 +295,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         for idx, sample_results in enumerate(mcts_results):
             # Extract molecules from top-k results
             for smi, score, mol in sample_results:
-                predicted_mols[idx].append(mol)
+                predicted_mols[idx].append(mol) # [bs, num_predictions]
                 
         with open(f"preds/{self.name}_rank_{self.global_rank}_pred_{i}.pkl", "wb") as f:
             pickle.dump(predicted_mols, f)
@@ -560,7 +559,6 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         num_simulations: int,
         K: int,
         c_puct: float,
-        return_topk: int = 5,
     ) -> List[Tuple[str, float, Chem.Mol]]:
         # root state at t=T
         T = self.T
@@ -618,14 +616,14 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 score = float(self._mcts_evaluate(ln, env_meta, spectra))
             results.append((smi, score, mol))
             seen_smi.add(smi)
-            if len(results) >= return_topk:
+            if len(results) >= self.test_num_samples:
                 break
 
         # 2) fill remaining by completing best non-terminal leaves (by V) to terminal greedily
-        if len(results) < return_topk and nonterminal_leaves:
+        if len(results) < self.test_num_samples and nonterminal_leaves:
             nonterminal_leaves.sort(key=lambda n_: n_.V, reverse=True)
             for ln in nonterminal_leaves:
-                if len(results) >= return_topk:
+                if len(results) >= self.test_num_samples:
                     break
                 st = ln.state
                 X_cur = st['X_t']  # keep nodes fixed (edge-only denoising)
@@ -660,7 +658,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 seen_smi.add(smi)
 
         results.sort(key=lambda x: x[1], reverse=True)
-        return results[:return_topk]
+        return results[:self.test_num_samples]
 
     @torch.no_grad()
     def mcts_sample_batch(self, data: Batch, env_metas: List[dict], spectra: List[np.ndarray]) -> List[List[Tuple[str, float, Chem.Mol]]]:
@@ -685,7 +683,6 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 spectra=spectra_i,
                 num_simulations=self.mcts_config['num_simulation_steps'],
                 K=self.mcts_config['branch_k'], c_puct=self.mcts_config['c_puct'],
-                return_topk=self.mcts_config['return_topk']
             )
             out.append(res_i)
         return out
