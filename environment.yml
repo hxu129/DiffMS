@@ -1,6 +1,8 @@
 name: unified-ms-env
 channels:
   - conda-forge
+  - bioconda
+  - pyg
 dependencies:
   - _openmp_mutex=4.5
   - aiohappyeyeballs=2.6.1
@@ -215,6 +217,7 @@ dependencies:
   - libzlib=1.3.1
   - llvm-openmp=21.1.3
   - lz4-c=1.10.0
+  - matchms
   - matplotlib=3.7.1
   - matplotlib-base=3.7.1
   - matplotlib-inline=0.1.7
