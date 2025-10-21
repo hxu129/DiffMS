@@ -453,13 +453,11 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             t_norm = state['t_norm']
             sampled_one_hot, _ = self.sample_p_zs_given_zt(s_norm, t_norm, state['X_t'], state['E_t'], state['y_t'], state['node_mask'])
             # uniqueness via hash of discrete E
-            # TODO: try to understand this
-            # FIXME: the state formula does not match
-            e_idx = torch.argmax(sampled_one_hot.E, dim=-1).detach().cpu().numpy()
-            h = e_idx.tobytes()
-            if h in seen:
-                continue
-            seen.add(h)
+            # e_idx = torch.argmax(sampled_one_hot.E, dim=-1).detach().cpu().numpy()
+            # h = e_idx.tobytes()
+            # if h in seen:
+            #     continue
+            # seen.add(h)
             next_t = t_int - 1
             # For the child state, its next sampling call will use s'=(next_t-1)/T, t'=(next_t)/T
             next_t_norm = torch.tensor([[next_t]], dtype=torch.float32, device=self.device) / self.T
@@ -488,23 +486,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         t_int = int(state['t_int'])
         score = 0.0
         if t_int == 0:
-            valid, smi, mol = self._terminal_check_and_smiles(state['X_t'][0], state['E_t'][0])
+            # FIXME: the shape is disgusting
+            X_hat = state['X_t'][0]
+            E_hat = state['E_t'][0]
             node.terminal = True
-            if not valid:
-                return -1.0
-            self._ensure_verifier()
-            if smi in self._smiles_score_cache:
-                score = float(self._smiles_score_cache[smi])
-            else:
-                score_list = self.verifier.score([smi], 
-                                                 env_meta['precursor_mz'], env_meta['adduct'], 
-                                                 env_meta['instrument'], env_meta['collision_eng'], spectra)
-                score = float(score_list[0])
-                self._smiles_score_cache[smi] = score
-            if node.parent is not None and (node.best_smiles is None or score > node.best_score):
-                node.best_smiles = smi
-                node.best_score = score
-            return score
         else:
             noisy_data = {'X_t': state['X_t'], 'E_t': state['E_t'], 'y_t': state['y_t'], 't': state['t_norm'], 'node_mask': state['node_mask']}
             extra_data = self.compute_extra_data(noisy_data)
@@ -523,24 +508,27 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
             out_one_hot = utils.PlaceHolder(X=X_hat, E=E_hat, y=state['y_t']).mask(state['node_mask']).type_as(state['y_t'])
 
-            X_hat = state['X_t']
-            E_hat = out_one_hot.E
+            X_hat = state['X_t'][0]
+            E_hat = out_one_hot.E[0]
 
-            valid, smi, mol = self._terminal_check_and_smiles(X_hat, E_hat)
-            if not valid:
-                return 0.0
-            self._ensure_verifier()
-            if smi in self._smiles_score_cache:
-                return float(self._smiles_score_cache[smi])
+        valid, smi, mol = self._terminal_check_and_smiles(X_hat, E_hat)
+        if not valid:
+            return -1.0
+        self._ensure_verifier()
+        if smi in self._smiles_score_cache:
+            score = float(self._smiles_score_cache[smi])
+        else:
+            # FIXME: why use smiles to generate score?
             score_list = self.verifier.score([smi], 
-                                             precursor_mz=env_meta['precursor_mz'],
-                                             adduct=env_meta['adduct'],
-                                             instrument=env_meta['instrument'],
-                                             collision_eng=env_meta['collision_eng'],
-                                             target_spectra=spectra)
+                                                env_meta['precursor_mz'], env_meta['adduct'], 
+                                                env_meta['instrument'], env_meta['collision_eng'], spectra)
+            # FIXME: the shape is disgusting
             score = float(score_list[0])
             self._smiles_score_cache[smi] = score
-            return score
+        if node.parent is not None and (node.best_smiles is None or score > node.best_score):
+            node.best_smiles = smi
+            node.best_score = score
+        return score
 
     def _mcts_backup(self, path: List[MctsNode], value: float) -> None:
         # Update NVrU along the path. Here value is already the evaluated result propagated upward.
