@@ -519,7 +519,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             score = float(self._smiles_score_cache[smi])
         else:
             # FIXME: why use smiles to generate score?
-            score_list = self.verifier.score([smi], 
+            score_list = self.verifier.score([mol], [smi], 
                                                 env_meta['precursor_mz'], env_meta['adduct'], 
                                                 env_meta['instrument'], env_meta['collision_eng'], spectra)
             # FIXME: the shape is disgusting

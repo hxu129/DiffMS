@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from rdkit import Chem
 from typing import Union, Optional, List
 
 # External deps are imported inside methods to keep import-time light
@@ -98,12 +99,16 @@ class IcebergVerifier(BaseVerifier):
 
     @torch.no_grad()
     def score(self,
+              mol_list: Union[List[Chem.Mol], Chem.Mol],
               smiles_list: Union[List[str], str],
               precursor_mz: float,
               adduct: str,
               instrument: Optional[str],
               collision_eng: Optional[float],
               target_spectra: np.ndarray) -> List[float]:
+
+        if isinstance(mol_list, Chem.Mol):
+            mol_list = [mol_list]
         if isinstance(smiles_list, str):
             smiles_list = [smiles_list]
         
@@ -113,13 +118,14 @@ class IcebergVerifier(BaseVerifier):
         from matchms import Spectrum
         scores = []
         
-        for smi in smiles_list:
+        for smi, mol in zip(smiles_list, mol_list):
             try:
                 # Predict using old ICEBERG model (no instrument, collision_eng, precursor_mz params)
                 output = self.joint_model.predict_mol(
+                    mol=mol,
                     smi=smi,
                     adduct=adduct,
-                    threshold=0.0,
+                    threshold=0,
                     device=self.device,
                     max_nodes=100,
                     binned_out=False,
