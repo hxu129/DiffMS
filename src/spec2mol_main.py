@@ -280,7 +280,7 @@ def main(cfg: DictConfig):
         logging.info(f"  - num_simulation_steps: {model.mcts_config['num_simulation_steps']}")
         logging.info(f"  - branch_k: {model.mcts_config['branch_k']}")
         logging.info(f"  - c_puct: {model.mcts_config['c_puct']}")
-        logging.info(f"  - return_topk: {model.mcts_config['return_topk']}")
+        logging.info(f"  - return_topk: {cfg.general.test_samples_to_generate}")
 
     callbacks = []
     callbacks.append(LearningRateMonitor(logging_interval='step'))
