@@ -3,6 +3,7 @@ import sys
 import pathlib
 import warnings
 import logging
+import wandb
 
 import torch
 torch.cuda.empty_cache()
@@ -174,6 +175,7 @@ def load_weights(model, path):
 def main(cfg: DictConfig):
     from rdkit import RDLogger
     RDLogger.DisableLog('rdApp.*')
+    wandb.login(key='d67b47e300c6a7aa4fd2eb9b431afe85b7b7ffbf')
 
     logger = logging.getLogger("msms_main")
     logger.setLevel(logging.INFO)
