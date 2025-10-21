@@ -32,7 +32,7 @@ source /root/miniforge3/etc/profile.d/conda.sh
 conda activate unified-ms-env
 
 # 切换到DiffMS目录
-cd /root/ms/DiffMS
+cd /local3/ericjiang/wgc/huaxu/ms/DiffMS
 
 # 根据模式运行测试
 case $MODE in

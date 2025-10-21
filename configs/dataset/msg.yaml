@@ -1,16 +1,16 @@
 name: msg
 remove_h: null
 stats_dir: null
-datadir: '/root/ms/DiffMS/data/msg'
+datadir: '/local3/ericjiang/wgc/huaxu/ms/DiffMS/data/msg'
 filter: False
 denoise_nodes: False
 merge: 'downproject_4096'  # 'none' | 'mist_fp' | 'merge-encoder_output-linear' |  'merge-encoder_output-mlp' | 'downproject_4096'
 morgan_nbits: 2048
 morgan_r: 2
-split_file: '/root/ms/DiffMS/data/msg/split.tsv'
+split_file: '/local3/ericjiang/wgc/huaxu/ms/DiffMS/data/msg/split.tsv'
 spec_features: 'peakformula'
 mol_features: 'fingerprint'
-subform_folder: '/root/ms/DiffMS/data/msg/subformulae/default_subformulae'
+subform_folder: '/local3/ericjiang/wgc/huaxu/ms/DiffMS/data/msg/subformulae/default_subformulae'
 augment_data: False
 remove_prob: 0.1
 remove_weights: 'exp'
@@ -18,8 +18,8 @@ inten_prob: 0.1
 inten_transform: 'float'
 cls_type: 'ms1'
 magma_aux_loss: False
-labels_file: '/root/ms/DiffMS/data/msg/labels.tsv'
-spec_folder: '/root/ms/DiffMS/data/msg/spec_files'
+labels_file: '/local3/ericjiang/wgc/huaxu/ms/DiffMS/data/msg/labels.tsv'
+spec_folder: '/local3/ericjiang/wgc/huaxu/ms/DiffMS/data/msg/spec_files'
 cache_featurizers: True
 set_pooling: 'cls'
 max_count: null

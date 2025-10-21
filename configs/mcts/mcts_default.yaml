@@ -8,8 +8,8 @@ verifier_batch_size: 32
 verifier_type: 'iceberg'
 
 iceberg:
-  gen_checkpoint: '/root/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_generate.ckpt'
-  inten_checkpoint: '/root/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_score.ckpt'
+  gen_checkpoint: '/local3/ericjiang/wgc/huaxu/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_generate.ckpt'
+  inten_checkpoint: '/local3/ericjiang/wgc/huaxu/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_score.ckpt'
 
 similarity:
   tolerance_da: 0.01

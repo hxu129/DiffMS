@@ -63,7 +63,7 @@ vim configs/dataset/msg.yaml
 ## ☐ 5. Run Quick Test
 
 ```
-python3 spec2mol_main.py dataset=canopus general.test_only=/root/ms/DiffMS/checkpoints/diffms_canopus.ckpt general.name=canopus_small_test train.eval_batch_size=8 general.test_samples_to_generate=10 general.wandb=disabled dataset.max_count=50
+python3 spec2mol_main.py dataset=canopus general.test_only=/local3/ericjiang/wgc/huaxu/ms/DiffMS/checkpoints/diffms_canopus.ckpt general.name=canopus_small_test train.eval_batch_size=8 general.test_samples_to_generate=10 general.wandb=disabled dataset.max_count=50
 ```
 
 ```bash

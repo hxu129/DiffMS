@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
-sys.path.insert(0, '/root/ms/DiffMS')
-sys.path.insert(0, '/root/ms/DiffMS/src')
+sys.path.insert(0, '/local3/ericjiang/wgc/huaxu/ms/DiffMS')
+sys.path.insert(0, '/local3/ericjiang/wgc/huaxu/ms/DiffMS/src')
 
 
 def test_imports():
@@ -62,7 +62,7 @@ def test_mcts_config():
     try:
         from omegaconf import OmegaConf
         
-        mcts_cfg = OmegaConf.load('/root/ms/DiffMS/configs/mcts/mcts_default.yaml')
+        mcts_cfg = OmegaConf.load('/local3/ericjiang/wgc/huaxu/ms/DiffMS/configs/mcts/mcts_default.yaml')
         logger.info(f"✓ MCTS config loaded")
         logger.info(f"  use_mcts: {mcts_cfg.use_mcts}")
         logger.info(f"  num_simulation_steps: {mcts_cfg.num_simulation_steps}")
@@ -89,8 +89,8 @@ def test_verifier_init():
     try:
         from src.mcts_verifier import IcebergVerifier
         
-        gen_ckpt = '/root/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_generate.ckpt'
-        inten_ckpt = '/root/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_score.ckpt'
+        gen_ckpt = '/local3/ericjiang/wgc/huaxu/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_generate.ckpt'
+        inten_ckpt = '/local3/ericjiang/wgc/huaxu/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_score.ckpt'
         
         logger.info("Initializing ICEBERG verifier...")
         verifier = IcebergVerifier(
@@ -144,7 +144,7 @@ def test_model_load():
         from src.analysis.visualization import MolecularVisualization
         
         # Load configs
-        config_dir = Path('/root/ms/DiffMS/configs')
+        config_dir = Path('/local3/ericjiang/wgc/huaxu/ms/DiffMS/configs')
         general_cfg = OmegaConf.load(config_dir / 'general' / 'general_default.yaml')
         model_cfg = OmegaConf.load(config_dir / 'model' / 'model_default.yaml')
         train_cfg = OmegaConf.load(config_dir / 'train' / 'train_default.yaml')
@@ -207,7 +207,7 @@ def test_model_load():
                 logger.warning("⚠ Verifier is None (will be lazy-loaded)")
         
         logger.info("Loading checkpoint...")
-        checkpoint_path = '/root/ms/DiffMS/checkpoints/diffms_canopus.ckpt'
+        checkpoint_path = '/local3/ericjiang/wgc/huaxu/ms/DiffMS/checkpoints/diffms_canopus.ckpt'
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         state_dict = checkpoint.get('state_dict', checkpoint)
         

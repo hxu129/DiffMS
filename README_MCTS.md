@@ -31,7 +31,7 @@
 ### 1. 环境准备
 
 ```bash
-cd /root/ms/DiffMS
+cd /local3/ericjiang/wgc/huaxu/ms/DiffMS
 conda activate unified-ms-env
 ```
 
@@ -443,7 +443,7 @@ MIT License - 详见 [LICENSE](LICENSE) 文件
 开始使用:
 
 ```bash
-cd /root/ms/DiffMS
+cd /local3/ericjiang/wgc/huaxu/ms/DiffMS
 conda activate unified-ms-env
 bash RUN_TESTS.sh quick
 ```

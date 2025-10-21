@@ -1,7 +1,7 @@
 python src/spec2mol_main.py \
     train.eval_batch_size=128 \
     dataset.max_count=100 \
-    general.test_only=/root/ms/DiffMS/checkpoints/diffms_canopus.ckpt \
+    general.test_only=/local3/ericjiang/wgc/huaxu/ms/DiffMS/checkpoints/diffms_canopus.ckpt \
     general.name=dev \
     general.wandb_name=test \
     general.sample_every_val=1000 \

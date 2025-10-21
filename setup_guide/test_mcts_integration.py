@@ -38,8 +38,8 @@ from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
 # Add DiffMS to path (since it's installed as a library, this may not be needed)
-sys.path.insert(0, '/root/ms/DiffMS')
-sys.path.insert(0, '/root/ms/DiffMS/src')
+sys.path.insert(0, '/local3/ericjiang/wgc/huaxu/ms/DiffMS')
+sys.path.insert(0, '/local3/ericjiang/wgc/huaxu/ms/DiffMS/src')
 
 
 def load_model_and_config(use_mcts=True):
@@ -57,7 +57,7 @@ def load_model_and_config(use_mcts=True):
     from src.analysis.visualization import MolecularVisualization
     
     # Load configs
-    config_dir = Path('/root/ms/DiffMS/configs')
+    config_dir = Path('/local3/ericjiang/wgc/huaxu/ms/DiffMS/configs')
     
     general_cfg = OmegaConf.load(config_dir / 'general' / 'general_default.yaml')
     model_cfg = OmegaConf.load(config_dir / 'model' / 'model_default.yaml')
@@ -80,7 +80,7 @@ def load_model_and_config(use_mcts=True):
     })
     
     # Set test mode
-    checkpoint_path = '/root/ms/DiffMS/checkpoints/diffms_canopus.ckpt'
+    checkpoint_path = '/local3/ericjiang/wgc/huaxu/ms/DiffMS/checkpoints/diffms_canopus.ckpt'
     cfg.general.test_only = checkpoint_path
     
     logger.info(f"MCTS enabled: {cfg.mcts.use_mcts}")
