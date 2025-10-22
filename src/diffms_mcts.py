@@ -548,8 +548,21 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         K: int,
         c_puct: float,
     ) -> List[Tuple[str, float, Chem.Mol]]:
+        # First deffuse t_thresh times 
+        t_thresh = int(self.T / 2)
+        for s_int in reversed(range(t_thresh, self.T)):
+            s_array = s_int * torch.ones((X_init.shape[0], 1), dtype=torch.float32, device=self.device)
+            # TODO: check the termination condition
+            t_array = s_array + 1
+            s_norm = s_array / self.T
+            t_norm = t_array / self.T
+
+            # Sample z_s
+            sampled_s, __ = self.sample_p_zs_given_zt(s_norm, t_norm, X_init, E_init, y, node_mask)
+            X_init, E_init = sampled_s.X, sampled_s.E
+
         # root state at t=T
-        T = self.T
+        T = t_thresh
         s_norm = torch.tensor([[T - 1]], dtype=torch.float32, device=self.device) / T
         t_norm = torch.tensor([[T]], dtype=torch.float32, device=self.device) / T
         root = MctsNode(
