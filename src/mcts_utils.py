@@ -82,7 +82,7 @@ def extract_metadata_from_spectra_objects(spectra_list, mol_list=None) -> Tuple[
         if spec.meta:
             for key in ['ionization', 'IONIZATION', 'adduct', 'ADDUCT']:
                 if key in spec.meta:
-                    adduct = spec.meta[key]
+                    adduct = spec.meta[key].replace(" ", "")
                     break
         
         # Extract instrument
