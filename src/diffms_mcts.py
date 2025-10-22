@@ -619,13 +619,15 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             st = ln.state
             X_t = st['X_t']
             E_t = st['E_t']
-            sampled_s = utils.PlaceHolder(X=X_t, E=E_t, y=st['y_t'])
-            sampled_s = sampled_s.mask(st['node_mask'], collapse=True).type_as(st['y_t'])
+            y = st['y_t']
+            node_mask = st['node_mask']
+            sampled_s = utils.PlaceHolder(X=X_t, E=E_t, y=y)
+            sampled_s = sampled_s.mask(node_mask, collapse=True)
             X_hat = sampled_s.X.squeeze(0)
             E_hat = sampled_s.E.squeeze(0)
             valid, smi, mol = self._terminal_check_and_smiles(X_hat, E_hat)
-            if not valid or smi in seen_smi:
-                continue
+            # if not valid or smi in seen_smi:
+            #     continue
             self._ensure_verifier()
             if smi in self._smiles_score_cache:
                 score = float(self._smiles_score_cache[smi])
@@ -652,19 +654,17 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 for s_int in reversed(range(0, t_cur)):
                     s_arr = torch.tensor([[s_int]], dtype=torch.float32, device=self.device) / self.T
                     t_arr = torch.tensor([[s_int + 1]], dtype=torch.float32, device=self.device) / self.T
-                    sampled_one_hot, _ = self.sample_p_zs_given_zt(s_arr, t_arr, X_cur, E_cur, y_cur, mask_cur)
+                    sampled_s, _ = self.sample_p_zs_given_zt(s_arr, t_arr, X_cur, E_cur, y_cur, mask_cur)
                     # only update edges
-                    E_cur = sampled_one_hot.E
+                    E_cur = sampled_s.E
                 # finalize X as current nodes (edge denoising only)
-                final_X = st['X_t']
-                final_E = E_cur
-                sampled_s = utils.PlaceHolder(X=final_X, E=final_E, y=y_cur)
-                sampled_s = sampled_s.mask(mask_cur, collapse=True).type_as(y_cur)
+                sampled_s.X = X_cur
+                sampled_s = sampled_s.mask(mask_cur, collapse=True)
                 X_hat = sampled_s.X.squeeze(0)
                 E_hat = sampled_s.E.squeeze(0)
                 valid, smi, mol = self._terminal_check_and_smiles(X_hat, E_hat)
-                if not valid or smi in seen_smi:
-                    continue
+                # if not valid or smi in seen_smi:
+                #     continue
                 # score via verifier (or cache)
                 self._ensure_verifier()
                 if smi in self._smiles_score_cache:
@@ -692,7 +692,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         out = []
         bs = X_all.shape[0]
-        for i in range(1):
+        for i in range(bs):
             X_i = X_all[i:i+1]
             E_i = E_all[i:i+1]
             y_i = y_all[i:i+1]
