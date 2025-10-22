@@ -225,6 +225,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             'c_puct': _get('c_puct', _get('c_uct', 1.0)),
             'time_budget_s': _get('time_budget_s', 0.0),
             'verifier_batch_size': _get('verifier_batch_size', 32),
+            't_thresh': _get('t_thresh', 10),
         }
         # External verifier should be injected; we only call verifier.score()
         self.verifier = getattr(self, 'verifier', None)
@@ -289,6 +290,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         true_mols = [Chem.inchi.MolFromInchi(data.get_example(idx).inchi) for idx in range(len(data))] # Is this correct?
         predicted_mols = [list() for _ in range(len(data))]
+
+        if self.global_rank == 0:
+            logging.info(f"Batch {i}: Generating {self.test_num_samples} molecules for {len(data)} samples...")
 
         env_metas, spectra_arrays = extract_from_dataset_batch(batch, self.trainer.datamodule.test_dataset)
         mcts_results = self.mcts_sample_batch(data, env_metas, spectra_arrays)
@@ -387,20 +391,8 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         return self.decoder(X, E, y, node_mask)
 
     def _terminal_check_and_smiles(self, X_0: torch.Tensor, E_0: torch.Tensor) -> Tuple[bool, Optional[str], Optional[Chem.Mol]]:
-        # mol_from_graphs expects discrete indices, not one-hot
-        if X_0.dim() > 1:
-            # If one-hot, convert to indices
-            X_indices = torch.argmax(X_0, dim=-1) if X_0.shape[-1] > 1 else X_0.squeeze(-1)
-        else:
-            X_indices = X_0
-        
-        if E_0.dim() > 2:
-            # If one-hot, convert to indices
-            E_indices = torch.argmax(E_0, dim=-1) if E_0.shape[-1] > 1 else E_0.squeeze(-1)
-        else:
-            E_indices = E_0
-            
-        mol = self.visualization_tools.mol_from_graphs(X_indices, E_indices)
+
+        mol = self.visualization_tools.mol_from_graphs(X_0, E_0)
         try:
             smi = Chem.MolToSmiles(mol)
             return True, smi, mol
@@ -451,7 +443,12 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         for idx in range(K):
             s_norm = state['s_norm']
             t_norm = state['t_norm']
-            sampled_one_hot, _ = self.sample_p_zs_given_zt(s_norm, t_norm, state['X_t'], state['E_t'], state['y_t'], state['node_mask'])
+            X_t = state['X_t']
+            E_t = state['E_t']
+            y = state['y_t']
+            node_mask = state['node_mask']
+            sampled_one_hot, _ = self.sample_p_zs_given_zt(s_norm, t_norm, X_t, E_t, y, node_mask)
+            E_next = sampled_one_hot.E
             # uniqueness via hash of discrete E
             # e_idx = torch.argmax(sampled_one_hot.E, dim=-1).detach().cpu().numpy()
             # h = e_idx.tobytes()
@@ -468,10 +465,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                     's_norm': next_s_norm,
                     't_norm': next_t_norm,
                     # edge-only denoising: keep X_t unchanged
-                    'X_t': state['X_t'],
-                    'E_t': sampled_one_hot.E,
-                    'y_t': state['y_t'],
-                    'node_mask': state['node_mask'],
+                    'X_t': X_t,
+                    'E_t': E_next,
+                    'y_t': y,
+                    'node_mask': node_mask,
                 },
                 children=[], parent=leaf,
                 terminal=(next_t == 0),
@@ -483,34 +480,46 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
     def _mcts_evaluate(self, node: MctsNode, env_meta: dict, spectra: np.ndarray) -> float:
         state = node.state
+        X_t = state['X_t']
+        E_t = state['E_t'] 
+        y = state['y_t']
+        node_mask = state['node_mask']
         t_int = int(state['t_int'])
         score = 0.0
         if t_int == 0:
-            # FIXME: the shape is disgusting
-            X_hat = state['X_t'][0]
-            E_hat = state['E_t'][0]
             node.terminal = True
+            sampled_s = utils.PlaceHolder(X=X_t, E=E_t, y=y)
+            sampled_s = sampled_s.mask(node_mask, collapse=True)
+            X_hat = sampled_s.X
+            E_hat = sampled_s.E
         else:
-            noisy_data = {'X_t': state['X_t'], 'E_t': state['E_t'], 'y_t': state['y_t'], 't': state['t_norm'], 'node_mask': state['node_mask']}
+            # ------- start of denoising step -------
+            noisy_data = {'X_t': X_t, 'E_t': E_t, 'y_t': y, 't': state['t_norm'], 'node_mask': node_mask}
             extra_data = self.compute_extra_data(noisy_data)
-            pred = self.forward(noisy_data, extra_data, state['node_mask'])
+            pred = self.forward(noisy_data, extra_data, node_mask)
             prob_E = F.softmax(pred.E, dim=-1)
             prob_X = F.softmax(pred.X, dim=-1)
             assert ((prob_X.sum(dim=-1) - 1).abs() < 1e-4).all()
             assert ((prob_E.sum(dim=-1) - 1).abs() < 1e-4).all()
 
-            sampled_s = diffusion_utils.sample_discrete_features(prob_X, prob_E, node_mask=state['node_mask'])
-            X_hat = F.one_hot(sampled_s.X, num_classes=self.Xdim_output).float()
-            E_hat = F.one_hot(sampled_s.E, num_classes=self.Edim_output).float()
+            sampled_s = diffusion_utils.sample_discrete_features(prob_X, prob_E, node_mask=node_mask)
+            X_s = F.one_hot(sampled_s.X, num_classes=self.Xdim_output).float()
+            E_s = F.one_hot(sampled_s.E, num_classes=self.Edim_output).float()
 
-            assert (E_hat == torch.transpose(E_hat, 1, 2)).all()
-            assert (X_hat.shape == state['X_t'].shape) and (E_hat.shape == state['E_t'].shape)
+            assert (E_s == torch.transpose(E_s, 1, 2)).all()
+            assert (X_s.shape == X_t.shape) and (E_s.shape == E_t.shape)
 
-            out_one_hot = utils.PlaceHolder(X=X_hat, E=E_hat, y=state['y_t']).mask(state['node_mask']).type_as(state['y_t'])
+            sampled_s = utils.PlaceHolder(X=X_s, E=E_s, y=torch.zeros(y.shape[0], 0)).mask(node_mask).type_as(y)
+            # ------- end of denoising step -------
 
-            X_hat = state['X_t'][0]
-            E_hat = out_one_hot.E[0]
+            sampled_s.X = X_t
+            sampled_s = sampled_s.mask(node_mask, collapse=True)
+            X_hat = sampled_s.X
+            E_hat = sampled_s.E
 
+        X_hat = X_hat.squeeze(0) # batch size = 1, remove the batch dim
+        E_hat = E_hat.squeeze(0) # batch size = 1, remove the batch dim
+        
         valid, smi, mol = self._terminal_check_and_smiles(X_hat, E_hat)
         if not valid:
             return -1.0
@@ -547,9 +556,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         num_simulations: int,
         K: int,
         c_puct: float,
+        t_thresh: int,
     ) -> List[Tuple[str, float, Chem.Mol]]:
         # First deffuse t_thresh times 
-        t_thresh = int(self.T / 2)
         for s_int in reversed(range(t_thresh, self.T)):
             s_array = s_int * torch.ones((X_init.shape[0], 1), dtype=torch.float32, device=self.device)
             # TODO: check the termination condition
@@ -559,12 +568,13 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
             # Sample z_s
             sampled_s, __ = self.sample_p_zs_given_zt(s_norm, t_norm, X_init, E_init, y, node_mask)
-            X_init, E_init = sampled_s.X, sampled_s.E
+            E_init = sampled_s.E
 
         # root state at t=T
         T = t_thresh
-        s_norm = torch.tensor([[T - 1]], dtype=torch.float32, device=self.device) / T
-        t_norm = torch.tensor([[T]], dtype=torch.float32, device=self.device) / T
+        # TODO: the shape of X and E seems to be wrong
+        s_norm = torch.tensor([[T - 1]], dtype=torch.float32, device=self.device) / self.T
+        t_norm = torch.tensor([[T]], dtype=torch.float32, device=self.device) / self.T
         root = MctsNode(
             state={'t_int': T, 's_norm': s_norm, 't_norm': t_norm, 'X_t': X_init, 'E_t': E_init, 'y_t': y, 'node_mask': node_mask},
             children=[], parent=None, terminal=(T == 0),
@@ -607,7 +617,13 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         # 1) add scored terminal leaves first (evaluate if needed)
         for ln in terminal_leaves:
             st = ln.state
-            valid, smi, mol = self._terminal_check_and_smiles(st['X_t'][0], st['E_t'][0])
+            X_t = st['X_t']
+            E_t = st['E_t']
+            sampled_s = utils.PlaceHolder(X=X_t, E=E_t, y=st['y_t'])
+            sampled_s = sampled_s.mask(st['node_mask'], collapse=True).type_as(st['y_t'])
+            X_hat = sampled_s.X.squeeze(0)
+            E_hat = sampled_s.E.squeeze(0)
+            valid, smi, mol = self._terminal_check_and_smiles(X_hat, E_hat)
             if not valid or smi in seen_smi:
                 continue
             self._ensure_verifier()
@@ -642,7 +658,11 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 # finalize X as current nodes (edge denoising only)
                 final_X = st['X_t']
                 final_E = E_cur
-                valid, smi, mol = self._terminal_check_and_smiles(final_X[0], final_E[0])
+                sampled_s = utils.PlaceHolder(X=final_X, E=final_E, y=y_cur)
+                sampled_s = sampled_s.mask(mask_cur, collapse=True).type_as(y_cur)
+                X_hat = sampled_s.X.squeeze(0)
+                E_hat = sampled_s.E.squeeze(0)
+                valid, smi, mol = self._terminal_check_and_smiles(X_hat, E_hat)
                 if not valid or smi in seen_smi:
                     continue
                 # score via verifier (or cache)
@@ -650,7 +670,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 if smi in self._smiles_score_cache:
                     score = float(self._smiles_score_cache[smi])
                 else:
-                    score_list = self.verifier.score([smi], 
+                    score_list = self.verifier.score([mol], [smi], 
                                                      env_meta['precursor_mz'], env_meta['adduct'], 
                                                      env_meta['instrument'], env_meta['collision_eng'], spectra)
                     score = float(score_list[0])
@@ -672,7 +692,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         out = []
         bs = X_all.shape[0]
-        for i in range(bs):
+        for i in range(1):
             X_i = X_all[i:i+1]
             E_i = E_all[i:i+1]
             y_i = y_all[i:i+1]
@@ -684,6 +704,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 spectra=spectra_i,
                 num_simulations=self.mcts_config['num_simulation_steps'],
                 K=self.mcts_config['branch_k'], c_puct=self.mcts_config['c_puct'],
+                t_thresh=self.mcts_config['t_thresh'],
             )
             out.append(res_i)
         return out

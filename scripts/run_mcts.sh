@@ -15,3 +15,4 @@ CUDA_VISIBLE_DEVICES=1 python src/spec2mol_main.py \
     mcts.time_budget_s=0.0 \
     mcts.verifier_batch_size=32 \
     mcts.verifier_type=iceberg \
+    mcts.t_thresh=10
