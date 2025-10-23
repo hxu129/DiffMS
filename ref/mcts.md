@@ -61,7 +61,7 @@ In the language of reinforcement learning, the action is defined as $$a_t = \{(i
 ## Evaluation
 
 In the evaluation step, we do two things:
-1. Do one-step-denoising in a [[DDIM]] way, and get an approximation of the final molecule;
+1. Refereing to the [[DiffMS]] paper, at every time setp $t$ it tries to predic the original molecule at time $0$ and calculate the posterior probability for the current step denoising -- then directly use the prediction for time $t$ for evaluation;
 2. Use an external reward model to evaluate the quality of the approximated molecule -- Here we firstly use [[MassFormer]] to get the estimated mass spectrum, then we calculate the similarity between the estimation and the ground truth sequence.
 
 > The most commonly used similarity measure is cosine similarity between the binned spectrums -- However, there are many aggregation tricks in this field; details are in the [[MassFormer]] paper.
