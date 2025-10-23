@@ -3,6 +3,7 @@ import torch
 from rdkit import Chem
 from typing import Union, Optional, List
 from rdkit.Chem import Descriptors
+from matchms import Spectrum
 from collections import defaultdict
 import logging
 
@@ -52,7 +53,6 @@ class IcebergVerifier(BaseVerifier):
         self.bins_count = int(bins_count)
 
     def _to_matchms(self, spectra: np.ndarray, adduct: str, precursor_mz: float = None):
-        from matchms import Spectrum
         # Accept either binned vector (len==bins_count) or raw peaks (N,2)
         arr = np.asarray(spectra)
         if arr.ndim == 1 and arr.shape[0] == self.bins_count:
@@ -93,9 +93,9 @@ class IcebergVerifier(BaseVerifier):
             return np.array([[0.0, 0.0]])
         
         # Normalize intensities
-        max_inten = max(mass_to_inten.values())
-        if max_inten > 0:
-            mass_to_inten = {mz: inten / max_inten for mz, inten in mass_to_inten.items()}
+        # max_inten = max(mass_to_inten.values())
+        # if max_inten > 0:
+        #     mass_to_inten = {mz: inten / max_inten for mz, inten in mass_to_inten.items()}
         
         # Convert to sorted array
         spectrum = np.array(sorted(mass_to_inten.items()), dtype=float)
@@ -190,6 +190,76 @@ class IcebergVerifier(BaseVerifier):
 
         return np.array(merged, dtype=float)
 
+    def bin_spectra(self, spec: Spectrum, mz_min: int = 0, mz_max: int = 1000, bin_size: float = 10.0):
+        """
+        Bin spectrum to a common grid for consistent comparison.
+        
+        Args:
+            spec: matchms Spectrum object
+            mz_min: minimum m/z value (default: 0)
+            mz_max: maximum m/z value (default: 1000) 
+            bin_size: bin size in m/z units (default: 1.0)
+            
+        Returns:
+            tuple: (mz_grid, binned_intensities)
+        """
+        # Create common m/z grid
+        mz_grid = np.arange(mz_min, mz_max + bin_size, bin_size)
+        binned_intensities = np.zeros(len(mz_grid))
+        
+        if spec is None or len(spec.peaks.mz) == 0:
+            return mz_grid, binned_intensities
+            
+        # Get spectrum data
+        mz_values = spec.peaks.mz
+        intensities = spec.peaks.intensities
+        
+        # Bin each peak to the nearest grid point
+        for mz, intensity in zip(mz_values, intensities):
+            # Find the closest bin index
+            bin_idx = np.round((mz - mz_min) / bin_size).astype(int)
+            
+            # Check if within bounds
+            if bin_idx < 0:
+                binned_intensities[0] += intensity
+            elif bin_idx < len(mz_grid):
+                # Add intensity to the bin (sum if multiple peaks fall in same bin)
+                binned_intensities[bin_idx] += intensity
+            else:
+                binned_intensities[-1] += intensity
+                
+        metadata = spec.metadata
+        new_spec = Spectrum(mz=mz_grid, intensities=binned_intensities, metadata=metadata)
+                
+        return new_spec
+
+    def cosine_similarity_binned(self, spec1: Spectrum, spec2: Spectrum, 
+                                mz_min: int = 0, mz_max: int = 1000, bin_size: float = 1.0):
+        """
+        Compute cosine similarity between two spectra after binning to common grid.
+        
+        Args:
+            spec1, spec2: matchms Spectrum objects
+            mz_min, mz_max, bin_size: binning parameters
+            
+        Returns:
+            float: cosine similarity (0-1, higher is better)
+        """
+        # Bin both spectra to same grid
+        _, intensities1 = self.bin_spectra(spec1, mz_min, mz_max, bin_size)
+        _, intensities2 = self.bin_spectra(spec2, mz_min, mz_max, bin_size)
+        
+        # Compute cosine similarity
+        dot_product = np.dot(intensities1, intensities2)
+        norm1 = np.linalg.norm(intensities1)
+        norm2 = np.linalg.norm(intensities2)
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+            
+        return dot_product / (norm1 * norm2)
+
+
     @torch.no_grad()
     def score(self,
               mol_list: Union[List[Chem.Mol], Chem.Mol],
@@ -208,32 +278,32 @@ class IcebergVerifier(BaseVerifier):
         # Build target spectrum once
         spec_t = self._to_matchms(target_spectra, adduct, precursor_mz)
         
-        from matchms import Spectrum
         scores = []
         
         for smi, mol in zip(smiles_list, mol_list):
             # try:
                 # Proactively split disconnected molecules
-                fragments = self._split_disconnected_mol(mol)
+                # fragments = self._split_disconnected_mol(mol)
                 # Multiple components: predict each and combine with molecular-weight weights
                 specs_and_weights = []
-                for frag in fragments:
-                    # Skip fragments with no bonds (single atoms or invalid fragments)
-                    # These would cause errors in ICEBERG's GNN processing
-                    # TODO: room of speed up: filtering out the strings, instead of calling external tools to evaluate
-                    if frag.GetNumBonds() == 0:
-                        logging.warning(f"Skipping fragment with no bonds: {Chem.MolToSmiles(frag)}")
-                        continue
+                # for frag in fragments:
+                # Skip fragments with no bonds (single atoms or invalid fragments)
+                # These would cause errors in ICEBERG's GNN processing
+                # TODO: room of speed up: filtering out the strings, instead of calling external tools to evaluate
+                # if frag.GetNumBonds() == 0:
+                #     logging.warning(f"Skipping fragment with no bonds: {Chem.MolToSmiles(frag)}")
+                #     continue
                         
-                    frag_smi = Chem.MolToSmiles(frag, canonical=True)
-                    # Skip fragments that cannot be converted to valid SMILES
-                    # if frag_smi is None or not frag_smi.strip():
-                    #     logging.warning(f"Skipping fragment with invalid SMILES")
-                    #     continue
-                    logging.info(f"Predicting spectrum for fragment: {frag_smi}")    
-                    frag_spec = self._predict_spectrum_for(frag, frag_smi, adduct)
-                    mw = Descriptors.MolWt(frag) if frag is not None else 0.0
-                    specs_and_weights.append((frag_spec, mw))
+                frag = mol
+                frag_smi = Chem.MolToSmiles(frag, canonical=True)
+                # Skip fragments that cannot be converted to valid SMILES
+                # if frag_smi is None or not frag_smi.strip():
+                #     logging.warning(f"Skipping fragment with invalid SMILES")
+                #     continue
+                # logging.info(f"Predicting spectrum for fragment: {frag_smi}")    
+                frag_spec = self._predict_spectrum_for(frag, frag_smi, adduct)
+                mw = Descriptors.MolWt(frag) if frag is not None else 0.0
+                specs_and_weights.append((frag_spec, mw))
                     
                 # If no valid fragments after filtering, return empty spectrum
                 if not specs_and_weights:
@@ -253,9 +323,14 @@ class IcebergVerifier(BaseVerifier):
                         intensities=pred_spectrum[:, 1].astype(float),
                         metadata=pred_metadata
                     )
-                    result = self.cosine.pair(spec_p, spec_t)
+                    # bin to common grid
+                    spec_p = self.bin_spectra(spec_p)
+                    spec_t = self.bin_spectra(spec_t)
+                    result = self.cosine.pair(query=spec_p, reference=spec_t)
                     s = result['score'] # float, int: cosine score and number of matched peaks
                     scores.append(s if s is not None else 0.0)
+                    # logging
+                    logging.info(f"Cosine score: {s}")
                 else:
                     scores.append(0.0)
             # except Exception as e:
@@ -292,5 +367,6 @@ def build_verifier(cfg) -> BaseVerifier:
         )
     else:
         raise ValueError(f"Unsupported verifier_type: {vt}")
+
 
 
