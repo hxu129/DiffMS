@@ -747,21 +747,22 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         
         # Phase 2: BATCH SCORE ALL MOLECULES AT ONCE
         # This is the key optimization: one verifier call instead of hundreds/thousands
-        all_scores = []
-        if len(all_mols) > 0:
-            self._ensure_verifier()
-            all_scores = self.verifier.score_batch(
-                all_mols, all_smis,
-                all_precursor_mzs, all_adducts,
-                all_instruments, all_collision_engs,
-                all_target_specs
-            )
+        # all_scores = []
+        # if len(all_mols) > 0:
+        #     self._ensure_verifier()
+        #     all_scores = self.verifier.score_batch(
+        #         all_mols, all_smis,
+        #         all_precursor_mzs, all_adducts,
+        #         all_instruments, all_collision_engs,
+        #         all_target_specs
+        #     )
         
         # Phase 3: Scatter scores back to per-sample results
         # Build results structure: List[List[Tuple[str, float, mol]]]
         results = [[] for _ in range(batch_size)]
         for idx, (sample_idx, local_idx) in enumerate(sample_mol_map):
-            score = float(all_scores[idx])
+            # score = float(all_scores[idx])
+            score = 0.0
             results[sample_idx].append((all_smis[idx], score, all_mols[idx]))
         
         return results
@@ -1417,9 +1418,6 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 old_visits = tree.node_visits[b, n].item()
                 new_visits = old_visits + 1
                 tree.node_visits[b, n] = new_visits
-                
-                # Update reward: r = current_value
-                tree.node_rewards[b, n] = current_values[i].item()
                 
                 # Update value: V = (V * (N-1) + r) / N (running average)
                 old_value = tree.node_values[b, n].item()
