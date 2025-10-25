@@ -50,6 +50,81 @@ class MctsNode:
     best_smiles: Optional[str]
     best_score: float
 
+
+@dataclass
+class BatchedMctsTree:
+    """
+    Batched MCTS tree structure using PyTorch tensors for parallel operations.
+    
+    Inspired by mctx (https://github.com/deepmind/mctx) but implemented in PyTorch.
+    All tensors have batch dimension [B, ...] to enable parallel MCTS across multiple samples.
+    
+    Tree structure: Each node can have up to K children (branch_k).
+    Nodes are stored in a flat array [B, max_nodes], using indices to represent parent-child relationships.
+    
+    Constants:
+        ROOT_INDEX = 0: Root node is always at index 0
+        UNVISITED = -1: Marker for unvisited children
+        NO_PARENT = -1: Marker for root (no parent)
+    """
+    # Core MCTS statistics
+    # Shape: [batch_size, max_nodes]
+    node_visits: torch.Tensor     # N in UCT formula: number of times node visited
+    node_values: torch.Tensor     # V in UCT formula: cumulative value (sum of rewards)
+    node_rewards: torch.Tensor    # r: individual reward from last evaluation
+    
+    # Tree topology
+    # Shape: [batch_size, max_nodes]
+    parents: torch.Tensor         # Parent node index for each node, NO_PARENT for root
+    
+    # Children structure
+    # Shape: [batch_size, max_nodes, branch_k]
+    children_index: torch.Tensor  # Child node indices, UNVISITED if not expanded
+    children_visits: torch.Tensor # Visit counts for each child (redundant with node_visits but useful for selection)
+    children_values: torch.Tensor # Values for each child (redundant but useful for UCT)
+    
+    # State embeddings - molecular graph representations at each node
+    # Shape: [batch_size, max_nodes, n_atoms, ...]
+    node_states_X: torch.Tensor   # Node features (atom types) [B, N, n_atoms, X_dim]
+    node_states_E: torch.Tensor   # Edge features (bond types) [B, N, n_atoms, n_atoms, E_dim]
+    node_states_y: torch.Tensor   # Global features [B, N, y_dim]
+    node_masks: torch.Tensor      # Node masks [B, N, n_atoms]
+    
+    # Timestep and normalization info for diffusion
+    # Shape: [batch_size, max_nodes]
+    node_timesteps_int: torch.Tensor    # Integer timestep t_int
+    node_timesteps_norm: torch.Tensor   # Normalized timestep t_norm = t_int / T
+    node_s_norm: torch.Tensor           # s_norm = (t_int - 1) / T for denoising
+    
+    # Terminal status
+    # Shape: [batch_size, max_nodes]
+    is_terminal: torch.Tensor     # Boolean: whether node is terminal (t_int == 0)
+    
+    # Tracking per sample
+    # Shape: [batch_size]
+    num_nodes: torch.Tensor       # Current number of nodes allocated per sample
+    best_scores: torch.Tensor     # Best score found so far per sample
+    
+    # Best molecules tracking (not tensorizable due to variable-length strings)
+    best_smiles: List[List[str]] # [batch_size][...] list of best SMILES per sample
+    
+    # Constants (class variables)
+    ROOT_INDEX: int = 0
+    UNVISITED: int = -1
+    NO_PARENT: int = -1
+    
+    @property
+    def batch_size(self) -> int:
+        return self.node_visits.shape[0]
+    
+    @property
+    def max_nodes(self) -> int:
+        return self.node_visits.shape[1]
+    
+    @property
+    def branch_k(self) -> int:
+        return self.children_index.shape[2]
+
 class Spec2MolDenoisingDiffusion(pl.LightningModule):
     def __init__(self, cfg, dataset_infos, train_metrics, visualization_tools, extra_features,
                  domain_features):
@@ -399,290 +474,309 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         except:
             return False, None, None
 
-    def _mcts_select(self, root: MctsNode, c_puct: float) -> Tuple[list, MctsNode]:
-        # Only select among current leaf nodes using UCT; return (path_to_leaf, selected_leaf)
-        # First, traverse to collect all leaves with their path
-        stack = [(root, [root])]
-        leaves = []
-        while stack:
-            node, path = stack.pop()
-            if not node.children or node.terminal:
-                leaves.append((path, node))
-            else:
-                for ch in node.children:
-                    stack.append((ch, path + [ch]))
-        # Compute U for each leaf w.r.t its parent
-        best = None
-        best_score = -1e9
-        for path, leaf in leaves:
-            # UCT: V + c * sqrt(ln N(parent) / N(leaf))
-            if leaf.N == 0:
-                leaf.U = float('inf')
-                return (path, leaf)
-            else:
-                parent_N = max(1, leaf.parent.N)
-                leaf_U = c_puct * math.sqrt(math.log(parent_N) / leaf.N)
-                leaf.U = leaf_U
-                score = leaf.V + leaf.U
-            if score > best_score:
-                best_score = score
-                best = (path, leaf)
-        return best
-
-    def _mcts_expand(self, leaf: MctsNode, K: int) -> List[MctsNode]:
-        if leaf.terminal:
-            return []
-        state = leaf.state
-        t_int = int(state['t_int'])
-        if t_int <= 0:
-            leaf.terminal = True
-            return []
-        # Sample K next states by calling sample_p_zs_given_zt K times
-        leaf.children = []
-        seen = set()
-        for idx in range(K):
-            s_norm = state['s_norm']
-            t_norm = state['t_norm']
-            X_t = state['X_t']
-            E_t = state['E_t']
-            y = state['y_t']
-            node_mask = state['node_mask']
-            sampled_one_hot, _ = self.sample_p_zs_given_zt(s_norm, t_norm, X_t, E_t, y, node_mask)
-            E_next = sampled_one_hot.E
-            # uniqueness via hash of discrete E
-            # e_idx = torch.argmax(sampled_one_hot.E, dim=-1).detach().cpu().numpy()
-            # h = e_idx.tobytes()
-            # if h in seen:
-            #     continue
-            # seen.add(h)
-            next_t = t_int - 1
-            # For the child state, its next sampling call will use s'=(next_t-1)/T, t'=(next_t)/T
-            next_t_norm = torch.tensor([[next_t]], dtype=torch.float32, device=self.device) / self.T
-            next_s_norm = torch.tensor([[max(0, next_t - 1)]], dtype=torch.float32, device=self.device) / self.T
-            child = MctsNode(
-                state={
-                    't_int': next_t,
-                    's_norm': next_s_norm,
-                    't_norm': next_t_norm,
-                    # edge-only denoising: keep X_t unchanged
-                    'X_t': X_t,
-                    'E_t': E_next,
-                    'y_t': y,
-                    'node_mask': node_mask,
-                },
-                children=[], parent=leaf,
-                terminal=(next_t == 0),
-                N=0, V=0.0, r=0.0, best_smiles=None, best_score=-1e9,
-            )
-            leaf.children.append(child)
-        # No prior needed under classic UCT; children share parent equally via ln N(parent)
-        return leaf.children
-
-    def _mcts_evaluate(self, node: MctsNode, env_meta: dict, spectra: np.ndarray) -> float:
-        state = node.state
-        X_t = state['X_t']
-        E_t = state['E_t'] 
-        y = state['y_t']
-        node_mask = state['node_mask']
-        t_int = int(state['t_int'])
-        score = 0.0
-        if t_int == 0:
-            node.terminal = True
-            sampled_s = utils.PlaceHolder(X=X_t, E=E_t, y=y)
-            sampled_s = sampled_s.mask(node_mask, collapse=True)
-            X_hat = sampled_s.X
-            E_hat = sampled_s.E
-        else:
-            # ------- start of denoising step -------
-            noisy_data = {'X_t': X_t, 'E_t': E_t, 'y_t': y, 't': state['t_norm'], 'node_mask': node_mask}
-            extra_data = self.compute_extra_data(noisy_data)
-            pred = self.forward(noisy_data, extra_data, node_mask)
-            prob_E = F.softmax(pred.E, dim=-1)
-            prob_X = F.softmax(pred.X, dim=-1)
-            assert ((prob_X.sum(dim=-1) - 1).abs() < 1e-4).all()
-            assert ((prob_E.sum(dim=-1) - 1).abs() < 1e-4).all()
-
-            sampled_s = diffusion_utils.sample_discrete_features(prob_X, prob_E, node_mask=node_mask)
-            X_s = F.one_hot(sampled_s.X, num_classes=self.Xdim_output).float()
-            E_s = F.one_hot(sampled_s.E, num_classes=self.Edim_output).float()
-
-            assert (E_s == torch.transpose(E_s, 1, 2)).all()
-            assert (X_s.shape == X_t.shape) and (E_s.shape == E_t.shape)
-
-            sampled_s = utils.PlaceHolder(X=X_s, E=E_s, y=torch.zeros(y.shape[0], 0)).mask(node_mask).type_as(y)
-            # ------- end of denoising step -------
-
-            sampled_s.X = X_t
-            sampled_s = sampled_s.mask(node_mask, collapse=True)
-            X_hat = sampled_s.X
-            E_hat = sampled_s.E
-
-        X_hat = X_hat.squeeze(0) # batch size = 1, remove the batch dim
-        E_hat = E_hat.squeeze(0) # batch size = 1, remove the batch dim
-        
-        valid, smi, mol = self._terminal_check_and_smiles(X_hat, E_hat)
-        if not valid:
-            return -1.0
-        self._ensure_verifier()
-        if smi in self._smiles_score_cache:
-            score = float(self._smiles_score_cache[smi])
-        else:
-            # FIXME: why use smiles to generate score?
-            score_list = self.verifier.score([mol], [smi], 
-                                                env_meta['precursor_mz'], env_meta['adduct'], 
-                                                env_meta['instrument'], env_meta['collision_eng'], spectra)
-            # FIXME: the shape is disgusting
-            score = float(score_list[0])
-            self._smiles_score_cache[smi] = score
-        if node.parent is not None and (node.best_smiles is None or score > node.best_score):
-            node.best_smiles = smi
-            node.best_score = score
-        return score
-
-    def _mcts_backup(self, path: List[MctsNode], value: float) -> None:
-        # Update NVrU along the path. Here value is already the evaluated result propagated upward.
-        for node in path:
-            node.r = float(value)  # last evaluation result viewed from this node
-            node.N = int(node.N) + 1
-            node.V = (node.V * (node.N - 1) + node.r) / max(1, node.N)
-            # U is recomputed during selection; keep as informational
-
-    def _mcts_sample_single(
-        self,
-        X_init: torch.Tensor, E_init: torch.Tensor, y: torch.Tensor,
-        node_mask: torch.Tensor,
-        env_meta: dict,
-        spectra: np.ndarray,
-        num_simulations: int,
-        K: int,
-        c_puct: float,
-        t_thresh: int,
-    ) -> List[Tuple[str, float, Chem.Mol]]:
-        # First deffuse t_thresh times 
-        for s_int in reversed(range(t_thresh, self.T)):
-            s_array = s_int * torch.ones((X_init.shape[0], 1), dtype=torch.float32, device=self.device)
-            # TODO: check the termination condition
-            t_array = s_array + 1
-            s_norm = s_array / self.T
-            t_norm = t_array / self.T
-
-            # Sample z_s
-            sampled_s, __ = self.sample_p_zs_given_zt(s_norm, t_norm, X_init, E_init, y, node_mask)
-            E_init = sampled_s.E
-
-        # root state at t=T
-        T = t_thresh
-        # TODO: the shape of X and E seems to be wrong
-        s_norm = torch.tensor([[T - 1]], dtype=torch.float32, device=self.device) / self.T
-        t_norm = torch.tensor([[T]], dtype=torch.float32, device=self.device) / self.T
-        root = MctsNode(
-            state={'t_int': T, 's_norm': s_norm, 't_norm': t_norm, 'X_t': X_init, 'E_t': E_init, 'y_t': y, 'node_mask': node_mask},
-            children=[], parent=None, terminal=(T == 0),
-            N=0, V=0.0, r=0.0, best_smiles=None, best_score=-1e9,
-        )
-        # reset per-run results cache to avoid cross-sample leakage
-        self._smiles_score_cache = {}
-        for _ in range(int(num_simulations)):
-            path, leaf = self._mcts_select(root, c_puct)
-            # If not a leaf (or expandable), expand once to simulate forward then evaluate exactly one node
-            if not leaf.terminal and not leaf.children:
-                children = self._mcts_expand(leaf, K)
-                # evaluate all children and backup individually
-                for ch in children:
-                    v = self._mcts_evaluate(ch, env_meta, spectra)
-                    self._mcts_backup(path + [ch], v)
-            else:
-                v = self._mcts_evaluate(leaf, env_meta, spectra)
-                self._mcts_backup(path + [leaf], v)
-
-        # After search, prioritize true terminal leaves; then complete top non-terminal leaves to terminal
-        def _collect_leaves(n: MctsNode):
-            stack = [n]
-            leaves = []
-            while stack:
-                cur = stack.pop()
-                if not cur.children or cur.terminal:
-                    leaves.append(cur)
-                else:
-                    stack.extend(cur.children)
-            return leaves
-
-        leaves = _collect_leaves(root)
-        terminal_leaves = [ln for ln in leaves if int(ln.state['t_int']) == 0]
-        nonterminal_leaves = [ln for ln in leaves if int(ln.state['t_int']) > 0]
-
-        results: list[tuple[str, float, Chem.Mol]] = []
-        seen_smi = set()
-
-        # 1) add scored terminal leaves first (evaluate if needed)
-        for ln in terminal_leaves:
-            st = ln.state
-            X_t = st['X_t']
-            E_t = st['E_t']
-            y = st['y_t']
-            node_mask = st['node_mask']
-            sampled_s = utils.PlaceHolder(X=X_t, E=E_t, y=y)
-            sampled_s = sampled_s.mask(node_mask, collapse=True)
-            X_hat = sampled_s.X.squeeze(0)
-            E_hat = sampled_s.E.squeeze(0)
-            valid, smi, mol = self._terminal_check_and_smiles(X_hat, E_hat)
-            # if not valid or smi in seen_smi:
-            #     continue
-            self._ensure_verifier()
-            if smi in self._smiles_score_cache:
-                score = float(self._smiles_score_cache[smi])
-            else:
-                score = float(self._mcts_evaluate(ln, env_meta, spectra))
-            results.append((smi, score, mol))
-            seen_smi.add(smi)
-            if len(results) >= self.test_num_samples:
-                break
-
-        # 2) fill remaining by completing best non-terminal leaves (by V) to terminal greedily
-        if len(results) < self.test_num_samples and nonterminal_leaves:
-            nonterminal_leaves.sort(key=lambda n_: n_.V, reverse=True)
-            for ln in nonterminal_leaves:
-                if len(results) >= self.test_num_samples:
-                    break
-                st = ln.state
-                X_cur = st['X_t']  # keep nodes fixed (edge-only denoising)
-                E_cur = st['E_t']
-                y_cur = st['y_t']
-                mask_cur = st['node_mask']
-                t_cur = int(st['t_int'])
-                # standard denoising from current t down to 0
-                for s_int in reversed(range(0, t_cur)):
-                    s_arr = torch.tensor([[s_int]], dtype=torch.float32, device=self.device) / self.T
-                    t_arr = torch.tensor([[s_int + 1]], dtype=torch.float32, device=self.device) / self.T
-                    sampled_s, _ = self.sample_p_zs_given_zt(s_arr, t_arr, X_cur, E_cur, y_cur, mask_cur)
-                    # only update edges
-                    E_cur = sampled_s.E
-                # finalize X as current nodes (edge denoising only)
-                sampled_s.X = X_cur
-                sampled_s = sampled_s.mask(mask_cur, collapse=True)
-                X_hat = sampled_s.X.squeeze(0)
-                E_hat = sampled_s.E.squeeze(0)
-                valid, smi, mol = self._terminal_check_and_smiles(X_hat, E_hat)
-                # if not valid or smi in seen_smi:
-                #     continue
-                # score via verifier (or cache)
-                self._ensure_verifier()
-                if smi in self._smiles_score_cache:
-                    score = float(self._smiles_score_cache[smi])
-                else:
-                    score_list = self.verifier.score([mol], [smi], 
-                                                     env_meta['precursor_mz'], env_meta['adduct'], 
-                                                     env_meta['instrument'], env_meta['collision_eng'], spectra)
-                    score = float(score_list[0])
-                    self._smiles_score_cache[smi] = score
-                results.append((smi, score, mol))
-                seen_smi.add(smi)
-
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:self.test_num_samples]
-
     @torch.no_grad()
     def mcts_sample_batch(self, data: Batch, env_metas: List[dict], spectra: List[np.ndarray]) -> List[List[Tuple[str, float, Chem.Mol]]]:
+        """
+        Run batched MCTS for entire batch simultaneously.
+        
+        This replaces the sequential loop over samples with fully batched operations.
+        
+        Algorithm:
+        1. Initialize batched tree with root states
+        2. Pre-diffuse from T to t_thresh (batched)
+        3. For num_simulations iterations:
+           - Select: pick one leaf per sample using UCT (batched)
+           - Expand: create K children for each selected leaf (batched)
+           - Evaluate: score all new children with batched verifier (batched)
+           - Backup: propagate values to roots (batched)
+        4. Extract top-k results from each tree
+        
+        Args:
+            data: Batch of graph data from PyTorch Geometric
+            env_metas: List[dict] metadata per sample
+            spectra: List[np.ndarray] target spectra per sample
+            
+        Returns:
+            List of List of (smiles, score, mol) tuples, one list per sample
+        """
+        # Get number of graphs in batch using PyG's batch tensor
+        # data.batch is a tensor [num_total_nodes] where each value indicates which graph the node belongs to
+        # The maximum value + 1 gives us the batch size
+        # This matches how to_dense() and other parts of the code compute batch_size
+        batch_size = int(data.batch.max().item()) + 1
+        
+        # Dynamically calculate max_nodes based on config
+        # Upper bound: each simulation could create branch_k new nodes
+        # Add buffer for safety
+        max_nodes = self.mcts_config['num_simulation_steps'] * self.mcts_config['branch_k'] + 100
+        
+        if self.global_rank == 0:
+            logging.info(f"Starting batched MCTS with batch_size={batch_size}, max_nodes={max_nodes}")
+        
+        # Initialize batched tree
+        tree = self._initialize_batched_tree(data, max_nodes)
+        
+        # Pre-diffuse root states from T to t_thresh
+        tree = self._batched_prediffuse(tree, self.mcts_config['t_thresh'])
+        
+        # Main MCTS loop: run num_simulation_steps iterations
+        num_simulations = self.mcts_config['num_simulation_steps']
+        K = self.mcts_config['branch_k']
+        c_puct = self.mcts_config['c_puct']
+        
+        for sim_step in range(num_simulations):
+            # 1. Selection: pick one leaf per sample using UCT
+            # Output: [batch_size] leaf indices
+            leaf_indices = self._batched_select(tree, c_puct)
+            
+            # 2. Expansion: create K children for each selected leaf
+            # Output: tree with new children, [batch_size, K] new child indices
+            tree, new_child_indices = self._batched_expand(tree, leaf_indices, K)
+            
+            # 3. Evaluation: score all new children (batched verifier call)
+            # Input: [batch_size, K] node indices
+            # Output: [batch_size, K] scores
+            child_scores = self._batched_evaluate(tree, new_child_indices, env_metas, spectra)
+            
+            # 4. Backup: propagate scores up to root
+            # Input: [batch_size, K] node indices and scores
+            tree = self._batched_backup(tree, new_child_indices, child_scores)
+            
+            if self.global_rank == 0 and (sim_step + 1) % 50 == 0:
+                logging.info(f"Completed {sim_step + 1}/{num_simulations} MCTS simulations")
+        
+        # Extract results from each tree
+        results = self._extract_batched_results(tree, env_metas, spectra)
+        
+        return results
+    
+    def _extract_batched_results(
+        self,
+        tree: BatchedMctsTree,
+        env_metas: List[dict],
+        spectra: List[np.ndarray]
+    ) -> List[List[Tuple[str, float, Chem.Mol]]]:
+        """
+        Extract top-k results from batched MCTS trees.
+        
+        **KEY OPTIMIZATION**: Batch ALL molecule scoring across all samples
+        into a single verifier call instead of scoring one at a time.
+        
+        Algorithm:
+        1. Collect all terminal nodes from all samples, sorted by Q-value
+        2. If we have enough terminal nodes (>= top_k), return top_k based on Q-value
+        3. If not enough terminal nodes, complete top non-terminal nodes to t=0
+        4. **BATCH SCORE ALL MOLECULES AT ONCE** using verifier.score_batch()
+        5. Scatter scores back to samples and return top-k per sample
+        
+        Args:
+            tree: Batched MCTS tree after search
+            env_metas: Metadata per sample
+            spectra: Target spectra per sample
+            
+        Returns:
+            List of List of (smiles, score, mol) tuples
+        """
+        batch_size = tree.batch_size
+        device = tree.node_visits.device
+        
+        if self.global_rank == 0:
+            logging.info(f"Extracting results from MCTS trees...")
+        
+        # Phase 1: Collect all molecules across all samples
+        # Track: (sample_idx, mol, smi, metadata)
+        all_mols = []
+        all_smis = []
+        all_precursor_mzs = []
+        all_adducts = []
+        all_instruments = []
+        all_collision_engs = []
+        all_target_specs = []
+        sample_mol_map = []  # List of (sample_idx, local_idx_in_sample)
+        
+        # Track per-sample results structure
+        sample_seen_smiles = [set() for _ in range(batch_size)]
+        sample_molecule_count = [0 for _ in range(batch_size)]
+        
+        for b in range(batch_size):
+            # Get all allocated nodes for this sample
+            num_nodes = tree.num_nodes[b].item()
+            node_indices = list(range(num_nodes))
+            
+            # Separate terminal and non-terminal nodes
+            terminal_indices = []
+            nonterminal_indices = []
+            for n in node_indices:
+                if tree.is_terminal[b, n]:
+                    terminal_indices.append(n)
+                else:
+                    nonterminal_indices.append(n)
+            
+            # Step 1: Collect all terminal nodes with their individual rewards (similarity scores)
+            # Note: Use node_rewards (r), not node_values (Q), for final selection
+            # node_rewards = individual similarity score for this node only (no path influence)
+            # node_values = propagated value through tree path (used during search)
+            terminal_with_reward = []
+            for n in terminal_indices:
+                visits = tree.node_visits[b, n].item()
+                if visits > 0:
+                    reward = tree.node_rewards[b, n].item()  # Individual similarity score
+                    terminal_with_reward.append((n, reward))
+            
+            # Sort terminal nodes by reward (similarity score) descending
+            terminal_with_reward.sort(key=lambda x: x[1], reverse=True)
+            
+            if self.global_rank == 0 and b == 0:
+                logging.info(f"Sample {b}: Found {len(terminal_with_reward)} terminal nodes, need {self.test_num_samples} molecules")
+            
+            # Step 2: Process terminal nodes (up to test_num_samples)
+            for n, reward in terminal_with_reward:
+                if sample_molecule_count[b] >= self.test_num_samples:
+                    break
+                
+                # Get final molecule
+                X_t = tree.node_states_X[b, n]
+                E_t = tree.node_states_E[b, n]
+                mask_t = tree.node_masks[b, n]
+                
+                # Collapse one-hot to indices and convert to numpy
+                sampled_placeholder = utils.PlaceHolder(
+                    X=X_t.unsqueeze(0), 
+                    E=E_t.unsqueeze(0), 
+                    y=tree.node_states_y[b, n].unsqueeze(0)
+                )
+                sampled_placeholder = sampled_placeholder.mask(mask_t.unsqueeze(0), collapse=True)
+                X_collapsed = sampled_placeholder.X.squeeze(0).cpu().numpy()
+                E_collapsed = sampled_placeholder.E.squeeze(0).cpu().numpy()
+                
+                valid, smi, mol = self._terminal_check_and_smiles(X_collapsed, E_collapsed)
+                if not valid or smi in sample_seen_smiles[b]:
+                    continue
+                
+                # Add to batch collection
+                all_mols.append(mol)
+                all_smis.append(smi)
+                all_precursor_mzs.append(env_metas[b]['precursor_mz'])
+                all_adducts.append(env_metas[b]['adduct'])
+                all_instruments.append(env_metas[b]['instrument'])
+                all_collision_engs.append(env_metas[b]['collision_eng'])
+                all_target_specs.append(spectra[b])
+                sample_mol_map.append((b, sample_molecule_count[b]))
+                
+                sample_seen_smiles[b].add(smi)
+                sample_molecule_count[b] += 1
+            
+            # Step 3: If not enough terminal nodes, complete top non-terminal nodes
+            if sample_molecule_count[b] < self.test_num_samples and nonterminal_indices:
+                # For non-terminals, use Q-values to select which nodes are worth completing
+                # Q-value estimates the expected quality if we complete this path
+                nonterminal_with_q = []
+                for n in nonterminal_indices:
+                    visits = tree.node_visits[b, n].item()
+                    if visits > 0:
+                        Q = tree.node_values[b, n].item()  # Q-value (propagated through path)
+                        nonterminal_with_q.append((n, Q))
+                
+                # Sort by Q descending (higher Q = more promising to complete)
+                nonterminal_with_q.sort(key=lambda x: x[1], reverse=True)
+                
+                needed = self.test_num_samples - sample_molecule_count[b]
+                if self.global_rank == 0 and b == 0:
+                    logging.info(f"Sample {b}: Need {needed} more molecules, completing top {len(nonterminal_with_q)} non-terminal nodes")
+                
+                # Complete each non-terminal node to terminal
+                for idx, (n, Q) in enumerate(nonterminal_with_q):
+                    if sample_molecule_count[b] >= self.test_num_samples:
+                        break
+                    
+                    # Get current state
+                    X_cur = tree.node_states_X[b, n]
+                    E_cur = tree.node_states_E[b, n]
+                    y_cur = tree.node_states_y[b, n]
+                    mask_cur = tree.node_masks[b, n]
+                    t_cur = tree.node_timesteps_int[b, n].item()
+                    
+                    if self.global_rank == 0 and b == 0 and idx % 10 == 0:
+                        logging.info(f"Sample {b}: Completing non-terminal node {idx+1}/{len(nonterminal_with_q)}, t={t_cur}, Q={Q:.4f}")
+                    
+                    # Denoise down to t=0
+                    for s_int in reversed(range(0, t_cur)):
+                        # Log progress for long denoising sequences
+                        if self.global_rank == 0 and b == 0 and idx == 0 and s_int % 20 == 0:
+                            logging.info(f"  Denoising step {t_cur - s_int}/{t_cur}")
+                        
+                        s_arr = torch.tensor([[s_int]], dtype=torch.float32, device=device) / self.T
+                        t_arr = torch.tensor([[s_int + 1]], dtype=torch.float32, device=device) / self.T
+                        
+                        X_batch = X_cur.unsqueeze(0)
+                        E_batch = E_cur.unsqueeze(0)
+                        y_batch = y_cur.unsqueeze(0)
+                        mask_batch = mask_cur.unsqueeze(0)
+                        
+                        sampled_s, _ = self.sample_p_zs_given_zt(s_arr, t_arr, X_batch, E_batch, y_batch, mask_batch)
+                        E_cur = sampled_s.E.squeeze(0)
+                    
+                    # Final molecule
+                    sampled_placeholder = utils.PlaceHolder(
+                        X=X_cur.unsqueeze(0), 
+                        E=E_cur.unsqueeze(0), 
+                        y=y_cur.unsqueeze(0)
+                    )
+                    sampled_placeholder = sampled_placeholder.mask(mask_cur.unsqueeze(0), collapse=True)
+                    X_collapsed = sampled_placeholder.X.squeeze(0).cpu().numpy()
+                    E_collapsed = sampled_placeholder.E.squeeze(0).cpu().numpy()
+                    
+                    valid, smi, mol = self._terminal_check_and_smiles(X_collapsed, E_collapsed)
+                    if not valid or smi in sample_seen_smiles[b]:
+                        if self.global_rank == 0 and b == 0:
+                            logging.info(f"  Skipping invalid/duplicate molecule")
+                        continue
+                    
+                    # Add to batch collection
+                    all_mols.append(mol)
+                    all_smis.append(smi)
+                    all_precursor_mzs.append(env_metas[b]['precursor_mz'])
+                    all_adducts.append(env_metas[b]['adduct'])
+                    all_instruments.append(env_metas[b]['instrument'])
+                    all_collision_engs.append(env_metas[b]['collision_eng'])
+                    all_target_specs.append(spectra[b])
+                    sample_mol_map.append((b, sample_molecule_count[b]))
+                    
+                    sample_seen_smiles[b].add(smi)
+                    sample_molecule_count[b] += 1
+        
+        # Phase 2: BATCH SCORE ALL MOLECULES AT ONCE
+        # This is the key optimization: one verifier call instead of hundreds/thousands
+        all_scores = []
+        if len(all_mols) > 0:
+            self._ensure_verifier()
+            all_scores = self.verifier.score_batch(
+                all_mols, all_smis,
+                all_precursor_mzs, all_adducts,
+                all_instruments, all_collision_engs,
+                all_target_specs
+            )
+        
+        # Phase 3: Scatter scores back to per-sample results
+        # Build results structure: List[List[Tuple[str, float, mol]]]
+        results = [[] for _ in range(batch_size)]
+        for idx, (sample_idx, local_idx) in enumerate(sample_mol_map):
+            score = float(all_scores[idx])
+            results[sample_idx].append((all_smis[idx], score, all_mols[idx]))
+        
+        # Phase 4: Take first test_num_samples results (no pre-sorting for fair comparison)
+        # Let the evaluation metrics handle ranking by frequency only
+        for b in range(batch_size):
+            # Don't sort by ICEBERG score here - let frequency-based ranking
+            # in K_ACC_Collection be the only ranking criterion for fair comparison
+            # Ensure we return exactly test_num_samples molecules (same as baseline)
+            results[b] = results[b]
+        
+        return results
+    
+    # Keep original methods for backward compatibility (not used in batched mode)
+    @torch.no_grad()
+    def mcts_sample_batch_original(self, data: Batch, env_metas: List[dict], spectra: List[np.ndarray]) -> List[List[Tuple[str, float, Chem.Mol]]]:
         dense_data, node_mask = utils.to_dense(data.x, data.edge_index, data.edge_attr, data.batch)
         
         z_T = diffusion_utils.sample_discrete_feature_noise(limit_dist=self.limit_dist, node_mask=node_mask)
@@ -784,3 +878,637 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         extra_y = torch.cat((extra_y, t), dim=1)
 
         return utils.PlaceHolder(X=extra_X, E=extra_E, y=extra_y)
+
+    # ==================== Batched MCTS Methods ====================
+    # These methods replace the sequential MCTS with batched operations
+    
+    def _initialize_batched_tree(self, data: Batch, max_nodes: int) -> BatchedMctsTree:
+        """
+        Initialize batched MCTS tree with root nodes.
+        
+        Algorithm:
+        - Convert dense data to batched tensors
+        - Sample initial noise for edges (X stays fixed for edge-only denoising)
+        - Allocate memory for max_nodes per sample
+        - Set root at index 0 for all samples
+        
+        Args:
+            data: Batch of graph data from PyTorch Geometric
+            max_nodes: Maximum nodes to allocate per sample
+            
+        Returns:
+            BatchedMctsTree with initialized roots
+        """
+        # Convert to dense format
+        # dense_data.X: [batch_size, n_atoms, X_dim]
+        # dense_data.E: [batch_size, n_atoms, n_atoms, E_dim]
+        # node_mask: [batch_size, n_atoms]
+        dense_data, node_mask = utils.to_dense(data.x, data.edge_index, data.edge_attr, data.batch)
+        batch_size = dense_data.X.shape[0]
+        n_atoms = dense_data.X.shape[1]
+        X_dim = dense_data.X.shape[2]
+        E_dim = dense_data.E.shape[3]
+        y_dim = data.y.shape[1]
+        
+        # Sample initial noise for edges (following original MCTS logic)
+        # X stays as is (edge-only denoising), E is sampled from limit distribution
+        z_T = diffusion_utils.sample_discrete_feature_noise(limit_dist=self.limit_dist, node_mask=node_mask)
+        X_init = dense_data.X  # [batch_size, n_atoms, X_dim]
+        E_init = z_T.E         # [batch_size, n_atoms, n_atoms, E_dim]
+        y_init = data.y        # [batch_size, y_dim]
+        
+        device = data.x.device
+        branch_k = self.mcts_config['branch_k']
+        
+        # Allocate tensors for tree structure
+        # Initialize all to zeros/defaults, will be filled as tree grows
+        node_visits = torch.zeros(batch_size, max_nodes, device=device, dtype=torch.int32)
+        node_values = torch.zeros(batch_size, max_nodes, device=device, dtype=torch.float32)
+        node_rewards = torch.zeros(batch_size, max_nodes, device=device, dtype=torch.float32)
+        parents = torch.full((batch_size, max_nodes), BatchedMctsTree.NO_PARENT, device=device, dtype=torch.int32)
+        
+        # Children arrays: [batch_size, max_nodes, branch_k]
+        children_index = torch.full((batch_size, max_nodes, branch_k), BatchedMctsTree.UNVISITED, 
+                                    device=device, dtype=torch.int32)
+        children_visits = torch.zeros(batch_size, max_nodes, branch_k, device=device, dtype=torch.int32)
+        children_values = torch.zeros(batch_size, max_nodes, branch_k, device=device, dtype=torch.float32)
+        
+        # State embeddings: [batch_size, max_nodes, ...]
+        node_states_X = torch.zeros(batch_size, max_nodes, n_atoms, X_dim, device=device, dtype=torch.float32)
+        node_states_E = torch.zeros(batch_size, max_nodes, n_atoms, n_atoms, E_dim, device=device, dtype=torch.float32)
+        node_states_y = torch.zeros(batch_size, max_nodes, y_dim, device=device, dtype=torch.float32)
+        node_masks = torch.zeros(batch_size, max_nodes, n_atoms, device=device, dtype=torch.bool)
+        
+        # Timestep info: [batch_size, max_nodes]
+        node_timesteps_int = torch.zeros(batch_size, max_nodes, device=device, dtype=torch.int32)
+        node_timesteps_norm = torch.zeros(batch_size, max_nodes, device=device, dtype=torch.float32)
+        node_s_norm = torch.zeros(batch_size, max_nodes, device=device, dtype=torch.float32)
+        
+        # Terminal status: [batch_size, max_nodes]
+        is_terminal = torch.zeros(batch_size, max_nodes, device=device, dtype=torch.bool)
+        
+        # Tracking arrays: [batch_size]
+        num_nodes = torch.ones(batch_size, device=device, dtype=torch.int32)  # Start with 1 (root)
+        best_scores = torch.full((batch_size,), -1e9, device=device, dtype=torch.float32)
+        best_smiles = [[] for _ in range(batch_size)]
+        
+        # Initialize root nodes (index 0) with starting states
+        node_states_X[:, 0] = X_init
+        node_states_E[:, 0] = E_init
+        node_states_y[:, 0] = y_init
+        node_masks[:, 0] = node_mask
+        
+        # Root starts at timestep T (maximum noise), will be pre-diffused to t_thresh
+        # Note: self.T is the total diffusion steps (e.g., 500)
+        T_max = self.T  # Start at maximum timestep
+        node_timesteps_int[:, 0] = T_max
+        node_timesteps_norm[:, 0] = T_max / self.T
+        node_s_norm[:, 0] = (T_max - 1) / self.T
+        is_terminal[:, 0] = False  # Root at T is never terminal
+        
+        return BatchedMctsTree(
+            node_visits=node_visits,
+            node_values=node_values,
+            node_rewards=node_rewards,
+            parents=parents,
+            children_index=children_index,
+            children_visits=children_visits,
+            children_values=children_values,
+            node_states_X=node_states_X,
+            node_states_E=node_states_E,
+            node_states_y=node_states_y,
+            node_masks=node_masks,
+            node_timesteps_int=node_timesteps_int,
+            node_timesteps_norm=node_timesteps_norm,
+            node_s_norm=node_s_norm,
+            is_terminal=is_terminal,
+            num_nodes=num_nodes,
+            best_scores=best_scores,
+            best_smiles=best_smiles
+        )
+    
+    def _batched_prediffuse(self, tree: BatchedMctsTree, t_thresh: int) -> BatchedMctsTree:
+        """
+        Pre-diffuse root states from T down to t_thresh using batched denoising.
+        
+        This matches the original _mcts_sample_single lines 562-571, but batched.
+        
+        Algorithm:
+        - For each timestep from T-1 down to t_thresh, denoise in parallel
+        - Update root states with denoised edges (X stays fixed)
+        
+        Args:
+            tree: Batched tree with roots at timestep T
+            t_thresh: Target timestep to diffuse down to
+            
+        Returns:
+            Updated tree with roots at timestep t_thresh
+        """
+        batch_size = tree.batch_size
+        device = tree.node_visits.device
+        
+        # Get root states: [batch_size, n_atoms, ...]
+        X_cur = tree.node_states_X[:, BatchedMctsTree.ROOT_INDEX]  # [B, n_atoms, X_dim]
+        E_cur = tree.node_states_E[:, BatchedMctsTree.ROOT_INDEX]  # [B, n_atoms, n_atoms, E_dim]
+        y_cur = tree.node_states_y[:, BatchedMctsTree.ROOT_INDEX]  # [B, y_dim]
+        mask_cur = tree.node_masks[:, BatchedMctsTree.ROOT_INDEX]  # [B, n_atoms]
+        
+        # Diffuse from T down to t_thresh
+        # Original code: for s_int in reversed(range(t_thresh, self.T))
+        for s_int in reversed(range(t_thresh, self.T)):
+            # s_array: [batch_size, 1]
+            s_array = torch.full((batch_size, 1), s_int, dtype=torch.float32, device=device)
+            t_array = s_array + 1
+            s_norm = s_array / self.T
+            t_norm = t_array / self.T
+            
+            # Batched denoising: sample_p_zs_given_zt handles batch dimension
+            sampled_s, _ = self.sample_p_zs_given_zt(s_norm, t_norm, X_cur, E_cur, y_cur, mask_cur)
+            # Update edges only (edge-only denoising)
+            E_cur = sampled_s.E
+        
+        # Update root states in tree
+        tree.node_states_E[:, BatchedMctsTree.ROOT_INDEX] = E_cur
+        tree.node_timesteps_int[:, BatchedMctsTree.ROOT_INDEX] = t_thresh
+        tree.node_timesteps_norm[:, BatchedMctsTree.ROOT_INDEX] = t_thresh / self.T
+        tree.node_s_norm[:, BatchedMctsTree.ROOT_INDEX] = (t_thresh - 1) / self.T
+        tree.is_terminal[:, BatchedMctsTree.ROOT_INDEX] = (t_thresh == 0)
+        
+        return tree
+    
+    def _batched_select(self, tree: BatchedMctsTree, c_puct: float) -> torch.Tensor:
+        """
+        Select one leaf node per sample using UCT (Upper Confidence bound for Trees).
+        
+        Algorithm (vectorized across batch):
+        - Identify all leaf nodes (no children OR terminal)
+        - Compute UCT score = V/N + c_puct * sqrt(ln(N_parent) / N_leaf) for each leaf
+        - Handle special case: unvisited nodes (N=0) get infinite priority
+        - Return argmax leaf index per sample
+        
+        UCT Formula:
+            UCT(node) = Q(node) + c_puct * sqrt(ln(N(parent)) / N(node))
+            where:
+            - Q(node) = V(node) / N(node): average value
+            - c_puct: exploration constant (config parameter)
+            - N: visit count
+            
+        Args:
+            tree: Batched MCTS tree
+            c_puct: Exploration constant for UCT formula
+            
+        Returns:
+            leaf_indices: [batch_size] indices of selected leaves
+        """
+        batch_size = tree.batch_size
+        max_nodes = tree.max_nodes
+        device = tree.node_visits.device
+        
+        # Identify leaf nodes: no children (first child is UNVISITED) but NOT terminal
+        # Terminal nodes should not be selected for expansion - they should only be backpropagated
+        # Shape: [batch_size, max_nodes]
+        is_leaf = (tree.children_index[:, :, 0] == BatchedMctsTree.UNVISITED) & ~tree.is_terminal
+        
+        # Only consider allocated nodes (node index < num_nodes for each sample)
+        # Shape: [batch_size, max_nodes]
+        node_indices = torch.arange(max_nodes, device=device).unsqueeze(0).expand(batch_size, -1)
+        is_allocated = node_indices < tree.num_nodes.unsqueeze(1)
+        is_valid_leaf = is_leaf & is_allocated
+        
+        # Compute Q-values: average value per visit
+        # Shape: [batch_size, max_nodes]
+        # Handle division by zero: use 0.0 for unvisited nodes (they'll get inf UCT anyway)
+        visits = tree.node_visits.float()
+        Q = torch.where(visits > 0, tree.node_values / visits, torch.zeros_like(tree.node_values))
+        # TODO the calculation of Q is strange -- node_values is mean? or cumulative sum?
+        
+        # Compute exploration term: c_puct * sqrt(ln(N_parent) / N_node)
+        # For each node, get parent's visit count
+        # Shape: [batch_size, max_nodes]
+        # Vectorized version: use advanced indexing to gather parent visits
+        parent_visits = torch.zeros_like(visits)
+        
+        # Create batch indices for advanced indexing
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, max_nodes)
+        
+        # For nodes with parents, get parent's visit count
+        has_parent = tree.parents != BatchedMctsTree.NO_PARENT
+        parent_visits[has_parent] = visits[batch_indices[has_parent], tree.parents[has_parent]]
+        
+        # For root nodes (no parent), use their own visit count
+        is_root = tree.parents == BatchedMctsTree.NO_PARENT
+        parent_visits[is_root] = visits[is_root]
+        
+        # UCT exploration term
+        # Shape: [batch_size, max_nodes]
+        # Add epsilon to avoid log(0) and division by zero
+        epsilon = 1e-8
+        exploration = c_puct * torch.sqrt(torch.log(parent_visits + epsilon) / (visits + epsilon))
+        
+        # Handle unvisited nodes: give them infinite priority (equivalent to original if N==0 return inf)
+        # Shape: [batch_size, max_nodes]
+        uct_scores = Q + exploration
+        uct_scores = torch.where(visits == 0, torch.tensor(float('inf'), device=device), uct_scores)
+        
+        # Mask out invalid nodes (non-leaves or unallocated)
+        # Shape: [batch_size, max_nodes]
+        uct_scores = torch.where(is_valid_leaf, uct_scores, torch.tensor(float('-inf'), device=device))
+        
+        # Select leaf with highest UCT score per sample
+        # Shape: [batch_size]
+        leaf_indices = torch.argmax(uct_scores, dim=1)
+        
+        return leaf_indices
+    
+    def _batched_expand(self, tree: BatchedMctsTree, leaf_indices: torch.Tensor, K: int) -> Tuple[BatchedMctsTree, torch.Tensor]:
+        """
+        Expand K children for selected leaves in parallel across batch.
+        
+        Algorithm:
+        - Gather states from selected leaf nodes [batch_size, ...]
+        - Repeat each state K times -> [batch_size*K, ...]
+        - Call sample_p_zs_given_zt once with batch_size*K samples (batched denoising)
+        - Allocate K new node indices per sample
+        - Store children states in tree
+        - Update parent-child relationships
+        
+        Args:
+            tree: Batched MCTS tree
+            leaf_indices: [batch_size] indices of leaves to expand
+            K: Number of children (branch_k from config)
+            
+        Returns:
+            tree: Updated tree with new children
+            new_child_indices: [batch_size, K] indices of newly created children
+        """
+        batch_size = tree.batch_size
+        device = tree.node_visits.device
+        batch_range = torch.arange(batch_size, device=device)
+        
+        # Check if leaves are terminal or already expanded
+        # Skip expansion for terminal nodes or nodes that already have children
+        is_terminal = tree.is_terminal[batch_range, leaf_indices]
+        has_children = tree.children_index[batch_range, leaf_indices, 0] != BatchedMctsTree.UNVISITED
+        can_expand = ~is_terminal & ~has_children
+        
+        # Allocate new node indices for children
+        # Shape: [batch_size, K]
+        new_child_indices = torch.zeros(batch_size, K, device=device, dtype=torch.int32)
+        for b in range(batch_size):
+            if can_expand[b]:
+                # Allocate K consecutive nodes
+                start_idx = tree.num_nodes[b]
+                new_child_indices[b] = torch.arange(start_idx, start_idx + K, device=device)
+                tree.num_nodes[b] += K
+        
+        # Gather states from leaves to expand
+        # Shape: [batch_size, n_atoms, ...]
+        leaf_X = tree.node_states_X[batch_range, leaf_indices]  # [B, n_atoms, X_dim]
+        leaf_E = tree.node_states_E[batch_range, leaf_indices]  # [B, n_atoms, n_atoms, E_dim]
+        leaf_y = tree.node_states_y[batch_range, leaf_indices]  # [B, y_dim]
+        leaf_mask = tree.node_masks[batch_range, leaf_indices]  # [B, n_atoms]
+        leaf_t_int = tree.node_timesteps_int[batch_range, leaf_indices]  # [B]
+        
+        # Repeat for K children: [batch_size*K, ...]
+        # Use repeat_interleave to repeat each sample K times: [s0, s0, s1, s1, ...] not [s0, s1, s0, s1, ...]
+        expanded_X = leaf_X.repeat_interleave(K, dim=0)  # [B*K, n_atoms, X_dim]
+        expanded_E = leaf_E.repeat_interleave(K, dim=0)  # [B*K, n_atoms, n_atoms, E_dim]
+        expanded_y = leaf_y.repeat_interleave(K, dim=0)  # [B*K, y_dim]
+        expanded_mask = leaf_mask.repeat_interleave(K, dim=0)  # [B*K, n_atoms]
+        expanded_t_int = leaf_t_int.repeat_interleave(K)  # [B*K]
+        
+        # Compute next timestep: t' = t - 1
+        # Shape: [B*K]
+        next_t_int = expanded_t_int - 1
+        next_t_int = torch.clamp(next_t_int, min=0)  # Ensure non-negative
+        
+        # Prepare s_norm and t_norm for denoising
+        # For child at timestep t', denoising uses s'=(t'-1)/T, t'=(t')/T
+        # Shape: [B*K, 1]
+        next_t_norm = (next_t_int.float() / self.T).unsqueeze(1)  # [B*K, 1]
+        next_s_norm = ((next_t_int.float() - 1).clamp(min=0) / self.T).unsqueeze(1)  # [B*K, 1]
+        
+        # Batched denoising: sample K children per sample in one forward pass
+        # sample_p_zs_given_zt handles batch dimension automatically
+        # Input: [B*K, ...], Output: [B*K, ...]
+        sampled_states, _ = self.sample_p_zs_given_zt(
+            next_s_norm, next_t_norm, expanded_X, expanded_E, expanded_y, expanded_mask
+        )
+        
+        # Extract sampled edges (edge-only denoising: keep X unchanged)
+        # Shape: [B*K, n_atoms, n_atoms, E_dim]
+        sampled_E = sampled_states.E
+        
+        # Reshape back to [batch_size, K, ...]
+        sampled_E_reshaped = sampled_E.view(batch_size, K, *sampled_E.shape[1:])  # [B, K, n_atoms, n_atoms, E_dim]
+        next_t_int_reshaped = next_t_int.view(batch_size, K)  # [B, K]
+        # Note: next_t_norm and next_s_norm are [B*K, 1], when reshaped they become [B, K] not [B, K, 1]
+        next_t_norm_reshaped = next_t_norm.squeeze(1).view(batch_size, K)  # [B, K]
+        next_s_norm_reshaped = next_s_norm.squeeze(1).view(batch_size, K)  # [B, K]
+        
+        # Store children states in tree
+        for b in range(batch_size):
+            if can_expand[b]:
+                leaf_idx = leaf_indices[b].item()
+                for k in range(K):
+                    child_idx = new_child_indices[b, k].item()
+                    # Store state (X stays same, E updated)
+                    tree.node_states_X[b, child_idx] = leaf_X[b]
+                    tree.node_states_E[b, child_idx] = sampled_E_reshaped[b, k]
+                    tree.node_states_y[b, child_idx] = leaf_y[b]
+                    tree.node_masks[b, child_idx] = leaf_mask[b]
+                    
+                    # Store timestep info
+                    tree.node_timesteps_int[b, child_idx] = next_t_int_reshaped[b, k]
+                    tree.node_timesteps_norm[b, child_idx] = next_t_norm_reshaped[b, k]
+                    tree.node_s_norm[b, child_idx] = next_s_norm_reshaped[b, k]
+                    tree.is_terminal[b, child_idx] = (next_t_int_reshaped[b, k] == 0)
+                    
+                    # Set parent relationship
+                    tree.parents[b, child_idx] = leaf_idx
+                    
+                    # Update parent's children_index
+                    tree.children_index[b, leaf_idx, k] = child_idx
+        
+        return tree, new_child_indices
+    
+    def _batched_evaluate(
+        self,
+        tree: BatchedMctsTree,
+        node_indices: torch.Tensor,  # [batch_size] or [batch_size, K]
+        env_metas: List[dict],
+        spectra: List[np.ndarray]
+    ) -> torch.Tensor:
+        """
+        Evaluate nodes using batched ICEBERG forward passes.
+        
+        Algorithm:
+        - Gather states from nodes to evaluate
+        - If terminal (t_int==0): use current state
+        - Else: denoise one step to get X_hat, E_hat
+        - Convert to molecules (RDKit, not batchable - must loop)
+        - Batch call verifier.score() with ALL valid molecules at once
+        - Return scores matching input shape
+        
+        Key optimization: Accumulate all molecules across batch, single verifier call.
+        
+        Args:
+            tree: Batched MCTS tree
+            node_indices: [batch_size] or [batch_size, K] indices to evaluate
+            env_metas: List[dict] metadata per sample (length batch_size)
+            spectra: List[np.ndarray] target spectra per sample (length batch_size)
+            
+        Returns:
+            scores: Same shape as node_indices, values are similarity scores
+        """
+        device = tree.node_visits.device
+        original_shape = node_indices.shape
+        
+        # Flatten to [N] for easier processing
+        node_indices_flat = node_indices.flatten()  # [N] where N = batch_size or batch_size*K
+        N = node_indices_flat.shape[0]
+        
+        # Determine which sample each node belongs to
+        if len(original_shape) == 1:
+            # [batch_size]: one node per sample
+            sample_indices = torch.arange(N, device=device)
+        else:
+            # [batch_size, K]: K nodes per sample
+            batch_size = original_shape[0]
+            K = original_shape[1]
+            sample_indices = torch.arange(batch_size, device=device).repeat_interleave(K)
+        
+        # Gather states from nodes to evaluate
+        # batch_indices: [N] which batch element each node belongs to (for indexing tree)
+        # For [batch_size] input: batch_indices = [0, 1, 2, ...batch_size-1]
+        # For [batch_size, K] input: batch_indices = [0, 0, ..., 1, 1, ..., batch_size-1, batch_size-1]
+        if len(original_shape) == 1:
+            batch_indices = sample_indices
+        else:
+            batch_indices = sample_indices
+        
+        # Gather node data: [N, ...]
+        X_t = tree.node_states_X[batch_indices, node_indices_flat]  # [N, n_atoms, X_dim]
+        E_t = tree.node_states_E[batch_indices, node_indices_flat]  # [N, n_atoms, n_atoms, E_dim]
+        y_t = tree.node_states_y[batch_indices, node_indices_flat]  # [N, y_dim]
+        mask_t = tree.node_masks[batch_indices, node_indices_flat]  # [N, n_atoms]
+        t_int = tree.node_timesteps_int[batch_indices, node_indices_flat]  # [N]
+        t_norm = tree.node_timesteps_norm[batch_indices, node_indices_flat]  # [N]
+        is_terminal = tree.is_terminal[batch_indices, node_indices_flat]  # [N]
+        
+        # Separate terminal and non-terminal nodes
+        terminal_mask = is_terminal  # [N]
+        
+        # Initialize output X_hat, E_hat with current states
+        X_hat = X_t.clone()  # [N, n_atoms, X_dim]
+        E_hat = E_t.clone()  # [N, n_atoms, n_atoms, E_dim]
+        
+        # For non-terminal nodes: denoise one step
+        non_terminal_mask = ~terminal_mask
+        if non_terminal_mask.any():
+            # Gather non-terminal states
+            nt_X = X_t[non_terminal_mask]  # [N_nt, n_atoms, X_dim]
+            nt_E = E_t[non_terminal_mask]  # [N_nt, n_atoms, n_atoms, E_dim]
+            nt_y = y_t[non_terminal_mask]  # [N_nt, y_dim]
+            nt_mask = mask_t[non_terminal_mask]  # [N_nt, n_atoms]
+            nt_t_norm = t_norm[non_terminal_mask].unsqueeze(1)  # [N_nt, 1]
+            
+            # Denoise: predict X_0 and E_0
+            noisy_data = {'X_t': nt_X, 'E_t': nt_E, 'y_t': nt_y, 't': nt_t_norm, 'node_mask': nt_mask}
+            extra_data = self.compute_extra_data(noisy_data)
+            pred = self.forward(noisy_data, extra_data, nt_mask)
+            
+            # Sample from predicted distribution
+            prob_E = F.softmax(pred.E, dim=-1)  # [N_nt, n_atoms, n_atoms, E_dim]
+            prob_X = F.softmax(pred.X, dim=-1)  # [N_nt, n_atoms, X_dim]
+            
+            sampled_s = diffusion_utils.sample_discrete_features(prob_X, prob_E, node_mask=nt_mask)
+            X_s = F.one_hot(sampled_s.X, num_classes=self.Xdim_output).float()
+            E_s = F.one_hot(sampled_s.E, num_classes=self.Edim_output).float()
+            
+            # Edge-only denoising: use original X, denoised E
+            X_hat[non_terminal_mask] = nt_X
+            E_hat[non_terminal_mask] = E_s
+        
+        # Collapse feature dimensions to atom/bond types
+        # Use PlaceHolder and mask to convert from one-hot to indices
+        sampled_placeholder = utils.PlaceHolder(X=X_hat, E=E_hat, y=y_t)
+        sampled_placeholder = sampled_placeholder.mask(mask_t, collapse=True)
+        
+        # Now X and E are collapsed: X is [N, n_atoms] with atom types, E is [N, n_atoms, n_atoms] with bond types
+        X_collapsed = sampled_placeholder.X  # [N, n_atoms]
+        E_collapsed = sampled_placeholder.E  # [N, n_atoms, n_atoms]
+        
+        mol_list = []
+        smi_list = []
+        valid_indices = []  # Track which nodes produced valid molecules
+        
+        for i in range(N):
+            # Extract single molecule (now in collapsed format)
+            # mol_from_graphs expects numpy arrays for proper indexing in Python loops
+            X_i = X_collapsed[i].cpu().numpy()  # [n_atoms] with atom type indices
+            E_i = E_collapsed[i].cpu().numpy()  # [n_atoms, n_atoms] with bond type indices
+            
+            # Convert to molecule using RDKit
+            valid, smi, mol = self._terminal_check_and_smiles(X_i, E_i)
+            if valid:
+                mol_list.append(mol)
+                smi_list.append(smi)
+                valid_indices.append(i)
+        
+        # Initialize scores with -1.0 (invalid molecule score)
+        scores = torch.full((N,), -1.0, device=device, dtype=torch.float32)
+        
+        # Batch evaluate all valid molecules at once
+        if len(mol_list) > 0:
+            # Prepare metadata for verifier
+            # Each valid molecule corresponds to a sample_index
+            mols_to_eval = mol_list
+            smis_to_eval = smi_list
+            precursor_mzs = [env_metas[sample_indices[idx].item()]['precursor_mz'] for idx in valid_indices]
+            adducts = [env_metas[sample_indices[idx].item()]['adduct'] for idx in valid_indices]
+            instruments = [env_metas[sample_indices[idx].item()]['instrument'] for idx in valid_indices]
+            collision_engs = [env_metas[sample_indices[idx].item()]['collision_eng'] for idx in valid_indices]
+            target_specs = [spectra[sample_indices[idx].item()] for idx in valid_indices]
+            
+            # Call verifier with all molecules at once (batched ICEBERG)
+            # This is the key optimization: one verifier call instead of N calls
+            self._ensure_verifier()
+            batch_scores = self.verifier.score_batch(
+                mols_to_eval, smis_to_eval,
+                precursor_mzs, adducts, instruments, collision_engs, target_specs
+            )
+            
+            # Convert to tensor if needed (verifier may return numpy array or list)
+            if isinstance(batch_scores, torch.Tensor):
+                batch_scores_tensor = batch_scores.to(device=device, dtype=torch.float32)
+            elif isinstance(batch_scores, np.ndarray):
+                batch_scores_tensor = torch.from_numpy(batch_scores).to(device=device, dtype=torch.float32)
+            elif isinstance(batch_scores, list):
+                # Convert list elements to float first to handle numpy scalars
+                batch_scores_tensor = torch.tensor([float(s) for s in batch_scores], device=device, dtype=torch.float32)
+            else:
+                # Single scalar value - convert to 1-element tensor
+                batch_scores_tensor = torch.tensor([float(batch_scores)], device=device, dtype=torch.float32)
+            
+            # Scatter scores back to original positions
+            for i, idx in enumerate(valid_indices):
+                scores[idx] = batch_scores_tensor[i]
+        
+        # Reshape to original shape
+        scores = scores.view(original_shape)
+        
+        return scores
+    
+    def _batched_backup(self, tree: BatchedMctsTree, node_indices: torch.Tensor, values: torch.Tensor) -> BatchedMctsTree:
+        """
+        Propagate values up the tree using batched operations.
+        
+        Algorithm (per sample, but vectorized where possible):
+        - Start from node_indices (newly evaluated nodes)
+        - Update node statistics: N += 1, r = value, V = (V * (N-1) + r) / N
+        - Propagate to parents iteratively until reaching roots
+        - Use scatter operations for efficiency where possible
+        
+        MCTS backup formula:
+            N(node) += 1  (visit count)
+            V(node) = (V(node) * (N(node) - 1) + reward) / N(node)  (running average)
+            
+        Args:
+            tree: Batched MCTS tree
+            node_indices: [batch_size] or [batch_size, K] starting nodes for backup
+            values: Same shape as node_indices, evaluation results
+            
+        Returns:
+            Updated tree with backed-up values
+        """
+        device = tree.node_visits.device
+        original_shape = node_indices.shape
+        batch_size = tree.batch_size
+        
+        # Flatten for easier processing
+        node_indices_flat = node_indices.flatten()  # [N]
+        values_flat = values.flatten()  # [N]
+        N = node_indices_flat.shape[0]
+        
+        # Determine which sample each node belongs to
+        if len(original_shape) == 1:
+            batch_indices = torch.arange(N, device=device)
+        else:
+            K = original_shape[1]
+            batch_indices = torch.arange(batch_size, device=device).repeat_interleave(K)
+        
+        # Propagate values up to root for each node
+        # We need to do this iteratively because different paths have different depths
+        max_depth = tree.max_nodes  # Upper bound on depth
+        
+        current_nodes = node_indices_flat.clone()  # [N]
+        current_values = values_flat.clone()  # [N]
+        
+        for depth in range(max_depth):
+            # Update statistics for current nodes
+            for i in range(N):
+                b = batch_indices[i].item()
+                n = current_nodes[i].item()
+                
+                # Skip if invalid node (reached root's parent)
+                if n < 0 or n == BatchedMctsTree.NO_PARENT:
+                    continue
+                
+                # Update visit count: N += 1
+                old_visits = tree.node_visits[b, n].item()
+                new_visits = old_visits + 1
+                tree.node_visits[b, n] = new_visits
+                
+                # Update reward: r = current_value
+                tree.node_rewards[b, n] = current_values[i].item()
+                
+                # Update value: V = (V * (N-1) + r) / N (running average)
+                old_value = tree.node_values[b, n].item()
+                new_value = (old_value * old_visits + current_values[i].item()) / new_visits
+                tree.node_values[b, n] = new_value
+            
+            # Move to parents
+            new_nodes = torch.zeros_like(current_nodes)
+            for i in range(N):
+                b = batch_indices[i].item()
+                n = current_nodes[i].item()
+                if n >= 0 and n != BatchedMctsTree.NO_PARENT:
+                    parent = tree.parents[b, n].item()
+                    new_nodes[i] = parent
+                else:
+                    new_nodes[i] = BatchedMctsTree.NO_PARENT
+            
+            # Check if all reached root's parent (NO_PARENT)
+            if (new_nodes == BatchedMctsTree.NO_PARENT).all():
+                break
+            
+            current_nodes = new_nodes
+            # Values stay the same as we propagate up
+        
+        # Also update children_visits and children_values for UCT selection
+        # For each child, update parent's children arrays
+        node_indices_flat = node_indices.flatten()
+        values_flat = values.flatten()
+        for i in range(N):
+            b = batch_indices[i].item()
+            n = node_indices_flat[i].item()
+            
+            if n < 0:
+                continue
+            
+            parent_idx = tree.parents[b, n].item()
+            if parent_idx == BatchedMctsTree.NO_PARENT:
+                continue
+            
+            # Find which child index this node is
+            for k in range(tree.branch_k):
+                if tree.children_index[b, parent_idx, k].item() == n:
+                    tree.children_visits[b, parent_idx, k] = tree.node_visits[b, n]
+                    # Use average value for child
+                    visits = tree.node_visits[b, n].item()
+                    if visits > 0:
+                        tree.children_values[b, parent_idx, k] = tree.node_values[b, n] / visits
+                    break
+        
+        return tree
