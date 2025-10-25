@@ -650,8 +650,8 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 E_collapsed = sampled_placeholder.E.squeeze(0).cpu().numpy()
                 
                 valid, smi, mol = self._terminal_check_and_smiles(X_collapsed, E_collapsed)
-                if not valid or smi in sample_seen_smiles[b]:
-                    continue
+                # if not valid or smi in sample_seen_smiles[b]:
+                #     continue
                 
                 # Add to batch collection
                 all_mols.append(mol)
@@ -674,7 +674,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 for n in nonterminal_indices:
                     visits = tree.node_visits[b, n].item()
                     if visits > 0:
-                        Q = tree.node_values[b, n].item()  # Q-value (propagated through path)
+                        Q = tree.node_values[b, n].item()  / visits # Q-value (propagated through path)
                         nonterminal_with_q.append((n, Q))
                 
                 # Sort by Q descending (higher Q = more promising to complete)
@@ -727,10 +727,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                     E_collapsed = sampled_placeholder.E.squeeze(0).cpu().numpy()
                     
                     valid, smi, mol = self._terminal_check_and_smiles(X_collapsed, E_collapsed)
-                    if not valid or smi in sample_seen_smiles[b]:
-                        if self.global_rank == 0 and b == 0:
-                            logging.info(f"  Skipping invalid/duplicate molecule")
-                        continue
+                    # if not valid or smi in sample_seen_smiles[b]:
+                    #     if self.global_rank == 0 and b == 0:
+                    #         logging.info(f"  Skipping invalid/duplicate molecule")
+                    #     continue
                     
                     # Add to batch collection
                     all_mols.append(mol)
@@ -763,14 +763,6 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         for idx, (sample_idx, local_idx) in enumerate(sample_mol_map):
             score = float(all_scores[idx])
             results[sample_idx].append((all_smis[idx], score, all_mols[idx]))
-        
-        # Phase 4: Take first test_num_samples results (no pre-sorting for fair comparison)
-        # Let the evaluation metrics handle ranking by frequency only
-        for b in range(batch_size):
-            # Don't sort by ICEBERG score here - let frequency-based ranking
-            # in K_ACC_Collection be the only ranking criterion for fair comparison
-            # Ensure we return exactly test_num_samples molecules (same as baseline)
-            results[b] = results[b]
         
         return results
 
@@ -1051,7 +1043,6 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         # Handle division by zero: use 0.0 for unvisited nodes (they'll get inf UCT anyway)
         visits = tree.node_visits.float()
         Q = torch.where(visits > 0, tree.node_values / visits, torch.zeros_like(tree.node_values))
-        # TODO the calculation of Q is strange -- node_values is mean? or cumulative sum?
         
         # Compute exploration term: c_puct * sqrt(ln(N_parent) / N_node)
         # For each node, get parent's visit count
@@ -1253,10 +1244,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         # batch_indices: [N] which batch element each node belongs to (for indexing tree)
         # For [batch_size] input: batch_indices = [0, 1, 2, ...batch_size-1]
         # For [batch_size, K] input: batch_indices = [0, 0, ..., 1, 1, ..., batch_size-1, batch_size-1]
-        if len(original_shape) == 1:
-            batch_indices = sample_indices
-        else:
-            batch_indices = sample_indices
+        batch_indices = sample_indices
         
         # Gather node data: [N, ...]
         X_t = tree.node_states_X[batch_indices, node_indices_flat]  # [N, n_atoms, X_dim]
@@ -1322,10 +1310,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             
             # Convert to molecule using RDKit
             valid, smi, mol = self._terminal_check_and_smiles(X_i, E_i)
-            if valid:
-                mol_list.append(mol)
-                smi_list.append(smi)
-                valid_indices.append(i)
+            mol_list.append(mol)
+            smi_list.append(smi)
+            valid_indices.append(i)
         
         # Initialize scores with -1.0 (invalid molecule score)
         scores = torch.full((N,), -1.0, device=device, dtype=torch.float32)
@@ -1436,7 +1423,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 
                 # Update value: V = (V * (N-1) + r) / N (running average)
                 old_value = tree.node_values[b, n].item()
-                new_value = (old_value * old_visits + current_values[i].item()) / new_visits
+                new_value = old_value + current_values[i].item()
                 tree.node_values[b, n] = new_value
             
             # Move to parents
@@ -1456,30 +1443,4 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             
             current_nodes = new_nodes
             # Values stay the same as we propagate up
-        
-        # Also update children_visits and children_values for UCT selection
-        # For each child, update parent's children arrays
-        node_indices_flat = node_indices.flatten()
-        values_flat = values.flatten()
-        for i in range(N):
-            b = batch_indices[i].item()
-            n = node_indices_flat[i].item()
-            
-            if n < 0:
-                continue
-            
-            parent_idx = tree.parents[b, n].item()
-            if parent_idx == BatchedMctsTree.NO_PARENT:
-                continue
-            
-            # Find which child index this node is
-            for k in range(tree.branch_k):
-                if tree.children_index[b, parent_idx, k].item() == n:
-                    tree.children_visits[b, parent_idx, k] = tree.node_visits[b, n]
-                    # Use average value for child
-                    visits = tree.node_visits[b, n].item()
-                    if visits > 0:
-                        tree.children_values[b, parent_idx, k] = tree.node_values[b, n] / visits
-                    break
-        
         return tree
