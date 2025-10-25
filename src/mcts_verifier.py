@@ -304,7 +304,11 @@ class IcebergVerifier(BaseVerifier):
         ):
             # Call original score method for each molecule
             # Note: This is a single molecule, so we pass it directly
-            score_list = self.score([mol], [smi], prec_mz, adduct, instrument, coll_eng, target_spec)
+            try:
+                score_list = self.score([mol], [smi], prec_mz, adduct, instrument, coll_eng, target_spec)
+            except Exception as e:
+                logging.error(f"Error processing molecule {smi}: {e}")
+                score_list = [0.0]
             scores.append(score_list[0])
         
         return scores
