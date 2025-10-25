@@ -773,35 +773,6 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             results[b] = results[b]
         
         return results
-    
-    # Keep original methods for backward compatibility (not used in batched mode)
-    @torch.no_grad()
-    def mcts_sample_batch_original(self, data: Batch, env_metas: List[dict], spectra: List[np.ndarray]) -> List[List[Tuple[str, float, Chem.Mol]]]:
-        dense_data, node_mask = utils.to_dense(data.x, data.edge_index, data.edge_attr, data.batch)
-        
-        z_T = diffusion_utils.sample_discrete_feature_noise(limit_dist=self.limit_dist, node_mask=node_mask)
-        X_all, E_all, y_all = dense_data.X, z_T.E, data.y
-
-        assert (E_all == torch.transpose(E_all, 1, 2)).all()
-
-        out = []
-        bs = X_all.shape[0]
-        for i in range(bs):
-            X_i = X_all[i:i+1]
-            E_i = E_all[i:i+1]
-            y_i = y_all[i:i+1]
-            mask_i = node_mask[i:i+1]
-            metas = env_metas[i]
-            spectra_i = spectra[i]
-            res_i = self._mcts_sample_single(
-                X_init=X_i, E_init=E_i, y=y_i, node_mask=mask_i, env_meta=metas,
-                spectra=spectra_i,
-                num_simulations=self.mcts_config['num_simulation_steps'],
-                K=self.mcts_config['branch_k'], c_puct=self.mcts_config['c_puct'],
-                t_thresh=self.mcts_config['t_thresh'],
-            )
-            out.append(res_i)
-        return out
 
     def sample_p_zs_given_zt(self, s, t, X_t, E_t, y_t, node_mask):
         """Samples from zs ~ p(zs | zt). Only used during sampling.
