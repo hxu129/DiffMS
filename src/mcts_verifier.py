@@ -273,7 +273,8 @@ class IcebergVerifier(BaseVerifier):
                    adducts: List[str],
                    instruments: List[Optional[str]],
                    collision_engs: List[Optional[float]],
-                   target_spectra_list: List[np.ndarray]) -> List[float]:
+                   target_spectra_list: List[np.ndarray],
+                   bin_size: float = 1.0) -> List[float]:
         """
         Batched version of score() that processes multiple molecules simultaneously.
         
@@ -346,8 +347,8 @@ class IcebergVerifier(BaseVerifier):
                     )
                         
                     # Bin to common grid for fair comparison
-                    spec_p = self.bin_spectra(spec_p)
-                    spec_t = self.bin_spectra(spec_t)
+                    spec_p = self.bin_spectra(spec_p, bin_size=bin_size)
+                    spec_t = self.bin_spectra(spec_t, bin_size=bin_size)
                         
                     result = self.cosine.pair(query=spec_p, reference=spec_t)
                     s = result['score']

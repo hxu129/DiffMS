@@ -833,7 +833,8 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 all_mols, all_smis,
                 all_precursor_mzs, all_adducts,
                 all_instruments, all_collision_engs,
-                all_target_specs
+                all_target_specs,
+                bin_size=self.cfg.mcts.similarity.bin_size
             )
         
         # Phase 3: Scatter scores back to per-sample results
