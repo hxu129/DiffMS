@@ -1058,86 +1058,142 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
     
     def _batched_select(self, tree: BatchedMctsTree, c_puct: float) -> torch.Tensor:
         """
-        Select one leaf node per sample using UCT (Upper Confidence bound for Trees).
+        Traverse tree from root using UCT until finding nodes ready for expansion.
+        
+        This implements the standard MCTS selection phase: starting from the root,
+        repeatedly select the best child according to UCT until reaching a node that
+        either (1) has no children yet (needs expansion) or (2) is terminal.
         
         Algorithm (vectorized across batch):
-        - Identify all leaf nodes (no children OR terminal)
-        - Compute UCT score = V/N + c_puct * sqrt(ln(N_parent) / N_leaf) for each leaf
-        - Handle special case: unvisited nodes (N=0) get infinite priority
-        - Return argmax leaf index per sample
+        1. Start at root nodes for all samples
+        2. For each current node, compute UCT scores for all its children
+        3. Select child with highest UCT score
+        4. Move to that child
+        5. Repeat until reaching unexpanded or terminal nodes
         
-        UCT Formula:
-            UCT(node) = Q(node) + c_puct * sqrt(ln(N(parent)) / N(node))
+        UCT Formula for child selection:
+            UCT(child) = Q(child) + c_puct * sqrt(log(N(parent)) / N(child))
             where:
-            - Q(node) = V(node) / N(node): average value
-            - c_puct: exploration constant (config parameter)
+            - Q(child) = V(child) / N(child): average value
+            - c_puct: exploration constant
             - N: visit count
+            - Unvisited children (N=0) get infinite UCT for exploration
             
         Args:
             tree: Batched MCTS tree
             c_puct: Exploration constant for UCT formula
             
         Returns:
-            leaf_indices: [batch_size] indices of selected leaves
+            leaf_indices: [batch_size] indices of nodes ready for expansion
         """
         batch_size = tree.batch_size
-        max_nodes = tree.max_nodes
         device = tree.node_visits.device
+        branch_k = tree.branch_k
         
-        # Identify leaf nodes: no children (first child is UNVISITED) but NOT terminal
-        # Terminal nodes should not be selected for expansion - they should only be backpropagated
-        # Shape: [batch_size, max_nodes]
-        is_leaf = (tree.children_index[:, :, 0] == BatchedMctsTree.UNVISITED) & ~tree.is_terminal
-        
-        # Only consider allocated nodes (node index < num_nodes for each sample)
-        # Shape: [batch_size, max_nodes]
-        node_indices = torch.arange(max_nodes, device=device).unsqueeze(0).expand(batch_size, -1)
-        is_allocated = node_indices < tree.num_nodes.unsqueeze(1)
-        is_valid_leaf = is_leaf & is_allocated
-        
-        # Compute Q-values: average value per visit
-        # Shape: [batch_size, max_nodes]
-        # Handle division by zero: use 0.0 for unvisited nodes (they'll get inf UCT anyway)
-        visits = tree.node_visits.float()
-        Q = torch.where(visits > 0, tree.node_values / visits, torch.zeros_like(tree.node_values))
-        
-        # Compute exploration term: c_puct * sqrt(ln(N_parent) / N_node)
-        # For each node, get parent's visit count
-        # Shape: [batch_size, max_nodes]
-        # Vectorized version: use advanced indexing to gather parent visits
-        parent_visits = torch.zeros_like(visits)
-        
-        # Create batch indices for advanced indexing
-        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, max_nodes)
-        
-        # For nodes with parents, get parent's visit count
-        has_parent = tree.parents != BatchedMctsTree.NO_PARENT
-        parent_visits[has_parent] = visits[batch_indices[has_parent], tree.parents[has_parent]]
-        
-        # For root nodes (no parent), use their own visit count
-        is_root = tree.parents == BatchedMctsTree.NO_PARENT
-        parent_visits[is_root] = visits[is_root]
-        
-        # UCT exploration term
-        # Shape: [batch_size, max_nodes]
-        # Add epsilon to avoid log(0) and division by zero
-        epsilon = 1e-8
-        exploration = c_puct * torch.sqrt(torch.log(parent_visits + epsilon) / (visits + epsilon))
-        
-        # Handle unvisited nodes: give them infinite priority (equivalent to original if N==0 return inf)
-        # Shape: [batch_size, max_nodes]
-        uct_scores = Q + exploration
-        uct_scores = torch.where(visits == 0, torch.tensor(float('inf'), device=device), uct_scores)
-        
-        # Mask out invalid nodes (non-leaves or unallocated)
-        # Shape: [batch_size, max_nodes]
-        uct_scores = torch.where(is_valid_leaf, uct_scores, torch.tensor(float('-inf'), device=device))
-        
-        # Select leaf with highest UCT score per sample
+        # Start at root for all samples
         # Shape: [batch_size]
-        leaf_indices = torch.argmax(uct_scores, dim=1)
+        current_nodes = torch.full((batch_size,), BatchedMctsTree.ROOT_INDEX, dtype=torch.int32, device=device)
+        batch_range = torch.arange(batch_size, device=device)
         
-        return leaf_indices
+        # Traverse tree until reaching unexpanded or terminal nodes
+        # Maximum depth is bounded by tree size to avoid infinite loops
+        max_depth = tree.max_nodes
+        
+        for depth in range(max_depth):
+            # Check if current nodes need expansion
+            # Shape: [batch_size]
+            has_children = tree.children_index[batch_range, current_nodes, 0] != BatchedMctsTree.UNVISITED
+            
+            # Nodes ready for expansion: no children yet OR terminal nodes
+            # Shape: [batch_size]
+            is_terminal_node = tree.is_terminal[batch_range, current_nodes]
+            ready_for_expansion = (~has_children) | is_terminal_node
+            # whether current node is ok to expand or not (leaf or not)
+            # has children -- not leaf
+            # is terminal -- leaf
+            # no children and not terminal -- not leaf
+            
+            # If all samples have found nodes ready for expansion, we're done
+            if ready_for_expansion.all():
+                break
+            
+            # For continuing samples: select best child using UCT
+            # Get children indices for current nodes: [batch_size, branch_k]
+            children_indices = tree.children_index[batch_range, current_nodes, :]  # [B, K]
+            
+            # Get child statistics for UCT computation using advanced indexing
+            # Shape: [batch_size, branch_k]
+            # Create a mask for valid children (not UNVISITED)
+            valid_children_mask = (children_indices != BatchedMctsTree.UNVISITED) & (children_indices >= 0)
+            
+            # Initialize with zeros
+            child_visits = torch.zeros(batch_size, branch_k, device=device, dtype=torch.float32)
+            child_values = torch.zeros(batch_size, branch_k, device=device, dtype=torch.float32)
+            
+            # For valid children, gather their statistics
+            # Use advanced indexing: for each (b, k), get tree.node_visits[b, children_indices[b, k]]
+            # Create batch indices: [batch_size, branch_k] repeating [0, 1, 2, ..., batch_size-1]
+            batch_indices_expanded = batch_range.unsqueeze(1).expand(batch_size, branch_k)
+            
+            # Clamp children_indices to valid range to avoid out-of-bounds (will be masked anyway)
+            children_indices_clamped = torch.clamp(children_indices, min=0, max=tree.max_nodes - 1)
+            
+            # Gather visits and values using advanced indexing
+            gathered_visits = tree.node_visits[batch_indices_expanded, children_indices_clamped].float()
+            gathered_values = tree.node_values[batch_indices_expanded, children_indices_clamped].float()
+            
+            # Apply mask to zero out invalid children
+            child_visits = torch.where(valid_children_mask, gathered_visits, child_visits)
+            child_values = torch.where(valid_children_mask, gathered_values, child_values)
+            
+            # Compute Q-values: average value per visit
+            # Shape: [batch_size, branch_k]
+            epsilon = 1e-8
+            Q = torch.where(child_visits > 0, child_values / child_visits, torch.zeros_like(child_values))
+            
+            # Get parent visit counts for exploration term
+            # Shape: [batch_size]
+            parent_visits = tree.node_visits[batch_range, current_nodes].float()
+            
+            # Compute UCT exploration term: c_puct * sqrt(log(N_parent) / N_child)
+            # Shape: [batch_size, branch_k]
+            exploration = c_puct * torch.sqrt(
+                torch.log(parent_visits.unsqueeze(1) + epsilon) / (child_visits + epsilon)
+            )
+            
+            # UCT score = Q + exploration
+            # Shape: [batch_size, branch_k]
+            uct_scores = Q + exploration
+            
+            # Mask out invalid children (UNVISITED)
+            # Shape: [batch_size, branch_k]
+            is_invalid = children_indices == BatchedMctsTree.UNVISITED
+            uct_scores = torch.where(is_invalid, torch.tensor(float('inf'), device=device), uct_scores) # the inf does not matter
+            
+            # Check if any sample has valid children to continue with
+            has_valid_children = ~is_invalid.all(dim=1)  # [batch_size]
+            
+            # Update should_continue: only continue if has valid children
+            should_continue = ~ready_for_expansion & has_valid_children # leaf do not have valid children so it will not continue
+            
+            # If no samples should continue, we're done
+            if not should_continue.any():
+                break
+            
+            # Select child with highest UCT score
+            # Shape: [batch_size]
+            best_child_idx = torch.argmax(uct_scores, dim=1)  # Index in [0, branch_k)
+            
+            # Get the actual node index of the best child for each sample
+            # Use advanced indexing: gather children_indices[b, best_child_idx[b]] for each b
+            # Shape: [batch_size]
+            next_nodes = torch.gather(children_indices, 1, best_child_idx.unsqueeze(1)).squeeze(1)
+            
+            # Update current_nodes only for samples that should continue
+            # For samples ready for expansion, keep current node
+            current_nodes = torch.where(should_continue, next_nodes, current_nodes)
+        
+        return current_nodes
     
     def _batched_expand(self, tree: BatchedMctsTree, leaf_indices: torch.Tensor, K: int) -> Tuple[BatchedMctsTree, torch.Tensor]:
         """
@@ -1179,6 +1235,12 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 start_idx = tree.num_nodes[b]
                 new_child_indices[b] = torch.arange(start_idx, start_idx + K, device=device)
                 tree.num_nodes[b] += K
+        
+        # For terminal nodes, set new_child_indices to leaf_indices (evaluate self, don't expand)
+        for b in range(batch_size):
+            if is_terminal[b]:
+                # Terminal nodes evaluate themselves K times (for batch structure consistency)
+                new_child_indices[b] = leaf_indices[b].repeat(K)
         
         # Gather states from leaves to expand
         # Shape: [batch_size, n_atoms, ...]
