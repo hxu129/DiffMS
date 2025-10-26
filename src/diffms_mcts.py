@@ -715,67 +715,89 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         # Each node has its own current timestep, and we decrement it as we denoise
         if len(nodes_to_complete) > 0:
             num_nodes_to_complete = len(nodes_to_complete)
-            b_indices = [item[0] for item in nodes_to_complete]
-            n_indices = [item[1] for item in nodes_to_complete]
-            initial_timesteps = torch.tensor([item[2] for item in nodes_to_complete], device=device, dtype=torch.int32)
             
-            # Gather all states at once: [num_nodes_to_complete, n_atoms, ...]
-            X_all = torch.stack([tree.node_states_X[b, n] for b, n in zip(b_indices, n_indices)])
-            E_all = torch.stack([tree.node_states_E[b, n] for b, n in zip(b_indices, n_indices)])
-            y_all = torch.stack([tree.node_states_y[b, n] for b, n in zip(b_indices, n_indices)])
-            mask_all = torch.stack([tree.node_masks[b, n] for b, n in zip(b_indices, n_indices)])
+            # Mini-batch size: tune based on GPU memory (e.g., 32, 64, 128)
+            # Smaller = less memory, Larger = faster (more vectorization)
+            chunk_size = self.cfg.train.eval_batch_size
             
-            # Track current timestep for each node: [num_nodes_to_complete]
-            current_timesteps = initial_timesteps.clone()
-            max_timestep = initial_timesteps.max().item()
+            # Store completed states for all nodes
+            completed_states = []
             
-            # Denoise iteratively: at each iteration, denoise nodes that still need denoising
-            # Continue until all nodes reach t=0
-            while current_timesteps.max().item() > 0:
-                # Create active mask: which nodes still need denoising (current_timestep > 0)
-                active_mask = current_timesteps > 0  # [num_nodes_to_complete]
+            # Process nodes in chunks
+            for chunk_start in range(0, num_nodes_to_complete, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, num_nodes_to_complete)
+                chunk = nodes_to_complete[chunk_start:chunk_end]
+                chunk_size_actual = len(chunk)
                 
-                if not active_mask.any():
-                    break
+                b_indices = [item[0] for item in chunk]
+                n_indices = [item[1] for item in chunk]
+                initial_timesteps = torch.tensor([item[2] for item in chunk], device=device, dtype=torch.int32)
                 
-                num_active = active_mask.sum().item()
-                if self.global_rank == 0 and current_timesteps.max().item() % 20 == 0:
-                    avg_t = current_timesteps[active_mask].float().mean().item()
-                    logging.info(f"  Denoising: {num_active}/{num_nodes_to_complete} nodes active (avg_t={avg_t:.1f})")
+                # Gather states for this chunk: [chunk_size, n_atoms, ...]
+                X_all = torch.stack([tree.node_states_X[b, n] for b, n in zip(b_indices, n_indices)])
+                E_all = torch.stack([tree.node_states_E[b, n] for b, n in zip(b_indices, n_indices)])
+                y_all = torch.stack([tree.node_states_y[b, n] for b, n in zip(b_indices, n_indices)])
+                mask_all = torch.stack([tree.node_masks[b, n] for b, n in zip(b_indices, n_indices)])
                 
-                # Prepare per-node timesteps for denoising
-                # For each active node at timestep t_cur, denoise from t_cur to t_cur-1
-                # s_arr[i] = (current_timesteps[i] - 1) / T
-                # t_arr[i] = current_timesteps[i] / T
+                # Track current timestep for each node in chunk: [chunk_size]
+                current_timesteps = initial_timesteps.clone()
                 
-                # For inactive nodes (already at t=0), set s=t=0 (no-op, but keeps batch structure)
-                s_int_per_node = torch.clamp(current_timesteps - 1, min=0)  # [num_nodes_to_complete]
-                t_int_per_node = current_timesteps  # [num_nodes_to_complete]
+                if self.global_rank == 0 and chunk_start == 0:
+                    max_timestep = initial_timesteps.max().item()
+                    logging.info(f"Processing {num_nodes_to_complete} nodes in {(num_nodes_to_complete + chunk_size - 1) // chunk_size} chunks of size {chunk_size} (max_t={max_timestep})")
                 
-                s_arr = (s_int_per_node.float() / self.T).unsqueeze(1)  # [num_nodes_to_complete, 1]
-                t_arr = (t_int_per_node.float() / self.T).unsqueeze(1)  # [num_nodes_to_complete, 1]
+                # Denoise iteratively: at each iteration, denoise nodes that still need denoising
+                # Continue until all nodes in this chunk reach t=0
+                while current_timesteps.max().item() > 0:
+                    # Create active mask: which nodes still need denoising (current_timestep > 0)
+                    active_mask = current_timesteps > 0  # [chunk_size]
+                    
+                    if not active_mask.any():
+                        break
+                    
+                    num_active = active_mask.sum().item()
+                    if self.global_rank == 0 and chunk_start == 0 and current_timesteps.max().item() % 20 == 0:
+                        avg_t = current_timesteps[active_mask].float().mean().item()
+                        logging.info(f"  Chunk 0 Denoising: {num_active}/{chunk_size_actual} nodes active (avg_t={avg_t:.1f})")
+                    
+                    # For inactive nodes (already at t=0), set s=t=0 (no-op, but keeps batch structure)
+                    s_int_per_node = torch.clamp(current_timesteps - 1, min=0)  # [chunk_size]
+                    t_int_per_node = current_timesteps  # [chunk_size]
+                    
+                    s_arr = (s_int_per_node.float() / self.T).unsqueeze(1)  # [chunk_size, 1]
+                    t_arr = (t_int_per_node.float() / self.T).unsqueeze(1)  # [chunk_size, 1]
+                    
+                    # Batched denoising: ALL nodes in chunk denoised together with their individual timesteps
+                    sampled_s, _ = self.sample_p_zs_given_zt(s_arr, t_arr, X_all, E_all, y_all, mask_all)
+                    
+                    # Update ONLY active nodes using the mask
+                    # For inactive nodes (already at t=0), keep their current state
+                    active_mask_expanded = active_mask.view(-1, 1, 1, 1)  # [chunk_size, 1, 1, 1]
+                    E_all = torch.where(active_mask_expanded, sampled_s.E, E_all)
+                    
+                    # Decrement timesteps for active nodes
+                    current_timesteps = torch.where(active_mask, current_timesteps - 1, current_timesteps)
                 
-                # Batched denoising: ALL nodes denoised together with their individual timesteps
-                sampled_s, _ = self.sample_p_zs_given_zt(s_arr, t_arr, X_all, E_all, y_all, mask_all)
+                # Store completed states from this chunk
+                for idx_in_chunk in range(chunk_size_actual):
+                    completed_states.append((
+                        X_all[idx_in_chunk],
+                        E_all[idx_in_chunk],
+                        y_all[idx_in_chunk],
+                        mask_all[idx_in_chunk]
+                    ))
                 
-                # Update ONLY active nodes using the mask
-                # For inactive nodes (already at t=0), keep their current state
-                active_mask_expanded = active_mask.view(-1, 1, 1, 1)  # [num_nodes_to_complete, 1, 1, 1]
-                E_all = torch.where(active_mask_expanded, sampled_s.E, E_all)
-                
-                # Decrement timesteps for active nodes
-                current_timesteps = torch.where(active_mask, current_timesteps - 1, current_timesteps)
+                # Clear chunk tensors to free memory
+                del X_all, E_all, y_all, mask_all, sampled_s
+                torch.cuda.empty_cache()
             
             # Process all completed molecules
             for idx, (b, n, t_init, Q) in enumerate(nodes_to_complete):
                 if sample_molecule_count[b] >= self.test_num_samples:
                     continue
                 
-                # Get final state
-                X_final = X_all[idx]
-                E_final = E_all[idx]
-                y_final = y_all[idx]
-                mask_final = mask_all[idx]
+                # Get final state from completed_states
+                X_final, E_final, y_final, mask_final = completed_states[idx]
                 
                 # Collapse to molecule
                 sampled_placeholder = utils.PlaceHolder(
