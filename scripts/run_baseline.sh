@@ -1,13 +1,11 @@
-python src/spec2mol_main.py \
-    dataset.max_count=100 \
+CUDA_VISIBLE_DEVICES=2 python src/spec2mol_main.py \
     train.eval_batch_size=128 \
     general.wandb_name=test \
     general.test_only=/local3/ericjiang/wgc/huaxu/ms/DiffMS/checkpoints/diffms_canopus.ckpt \
     general.name=dev \
-    general.sample_every_val=1000 \
-    general.test_samples_to_generate=10 \
-    general.val_samples_to_generate=100 \
-    general.log_every_steps=50 \
+    general.sample_every_val=100 \
+    general.test_samples_to_generate=1000 \
     general.gpus=1 \
     general.seed=123 \
-    mcts.use_mcts=false
+    mcts.use_mcts=false \
+    dataset.max_count=null \

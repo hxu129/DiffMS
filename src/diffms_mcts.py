@@ -24,7 +24,7 @@ from src import utils
 from src.mist.models.spectra_encoder import SpectraEncoderGrowing
 from dataclasses import dataclass
 import numpy as np
-from typing import Optional, List, Dict, Tuple
+from typing import Any, Optional, List, Dict, Tuple
 from .mcts_verifier import build_verifier
 
 # optional imports deferred in verifier to avoid heavy import at module load
@@ -598,48 +598,55 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         sample_seen_smiles = [set() for _ in range(batch_size)]
         sample_molecule_count = [0 for _ in range(batch_size)]
         
+        # ============ VECTORIZED PHASE 1: Identify all candidate nodes across batch ============
+        # Create masks for allocated nodes: [batch_size, max_nodes]
+        node_idx_grid = torch.arange(tree.max_nodes, device=device).unsqueeze(0).expand(batch_size, -1)
+        is_allocated = node_idx_grid < tree.num_nodes.unsqueeze(1)  # [batch_size, max_nodes]
+        has_visits = tree.node_visits > 0  # [batch_size, max_nodes]
+        is_valid_node = is_allocated & has_visits  # [batch_size, max_nodes]
+        
+        # Separate terminal and non-terminal nodes
+        is_terminal_valid = is_valid_node & tree.is_terminal  # [batch_size, max_nodes]
+        is_nonterminal_valid = is_valid_node & ~tree.is_terminal  # [batch_size, max_nodes]
+        
+        if self.global_rank == 0:
+            terminal_counts = is_terminal_valid.sum(dim=1)
+            nonterminal_counts = is_nonterminal_valid.sum(dim=1)
+            logging.info(f"Found {terminal_counts[0].item()} terminal, {nonterminal_counts[0].item()} non-terminal nodes (sample 0)")
+        
+        # ============ VECTORIZED PHASE 2: Sort and select terminal nodes ============
+        # Compute rewards for terminal nodes, set -inf for invalid
+        terminal_rewards = torch.where(
+            is_terminal_valid,
+            tree.node_rewards,
+            torch.tensor(float('-inf'), device=device)
+        )  # [batch_size, max_nodes]
+        
+        # Sort terminal nodes by reward descending per sample
+        sorted_rewards, sorted_indices = torch.sort(terminal_rewards, dim=1, descending=True)  # [batch_size, max_nodes]
+        
+        # Process terminal nodes (collect up to test_num_samples per sample)
         for b in range(batch_size):
-            # Get all allocated nodes for this sample
-            num_nodes = tree.num_nodes[b].item()
-            node_indices = list(range(num_nodes))
-            
-            # Separate terminal and non-terminal nodes
-            terminal_indices = []
-            nonterminal_indices = []
-            for n in node_indices:
-                if tree.is_terminal[b, n]:
-                    terminal_indices.append(n)
-                else:
-                    nonterminal_indices.append(n)
-            
-            # Step 1: Collect all terminal nodes with their individual rewards (similarity scores)
-            # Note: Use node_rewards (r), not node_values (Q), for final selection
-            # node_rewards = individual similarity score for this node only (no path influence)
-            # node_values = propagated value through tree path (used during search)
-            terminal_with_reward = []
-            for n in terminal_indices:
-                visits = tree.node_visits[b, n].item()
-                if visits > 0:
-                    reward = tree.node_rewards[b, n].item()  # Individual similarity score
-                    terminal_with_reward.append((n, reward))
-            
-            # Sort terminal nodes by reward (similarity score) descending
-            terminal_with_reward.sort(key=lambda x: x[1], reverse=True)
-            
+            num_terminals = is_terminal_valid[b].sum().item()
             if self.global_rank == 0 and b == 0:
-                logging.info(f"Sample {b}: Found {len(terminal_with_reward)} terminal nodes, need {self.test_num_samples} molecules")
+                logging.info(f"Sample {b}: Processing {min(num_terminals, self.test_num_samples)} terminal nodes")
             
-            # Step 2: Process terminal nodes (up to test_num_samples)
-            for n, reward in terminal_with_reward:
+            for rank in range(min(num_terminals, self.test_num_samples)):
                 if sample_molecule_count[b] >= self.test_num_samples:
                     break
                 
-                # Get final molecule
+                n = sorted_indices[b, rank].item()
+                reward = sorted_rewards[b, rank].item()
+                
+                if reward == float('-inf'):  # No more valid terminal nodes
+                    break
+                
+                # Get final molecule state
                 X_t = tree.node_states_X[b, n]
                 E_t = tree.node_states_E[b, n]
                 mask_t = tree.node_masks[b, n]
                 
-                # Collapse one-hot to indices and convert to numpy
+                # Collapse one-hot to indices
                 sampled_placeholder = utils.PlaceHolder(
                     X=X_t.unsqueeze(0), 
                     E=E_t.unsqueeze(0), 
@@ -650,8 +657,6 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 E_collapsed = sampled_placeholder.E.squeeze(0).cpu().numpy()
                 
                 valid, smi, mol = self._terminal_check_and_smiles(X_collapsed, E_collapsed)
-                # if not valid or smi in sample_seen_smiles[b]:
-                #     continue
                 
                 # Add to batch collection
                 all_mols.append(mol)
@@ -665,104 +670,155 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 
                 sample_seen_smiles[b].add(smi)
                 sample_molecule_count[b] += 1
+        
+        # ============ VECTORIZED PHASE 3: Complete non-terminal nodes with DYNAMIC MASKING ============
+        # Compute Q-values for non-terminal nodes
+        visits_safe = torch.clamp(tree.node_visits, min=1)  # Avoid division by zero
+        Q_values = tree.node_values / visits_safe  # [batch_size, max_nodes]
+        nonterminal_Q = torch.where(
+            is_nonterminal_valid,
+            Q_values,
+            torch.tensor(float('-inf'), device=device)
+        )  # [batch_size, max_nodes]
+        
+        # Sort non-terminal nodes by Q-value descending per sample
+        sorted_Q, sorted_nt_indices = torch.sort(nonterminal_Q, dim=1, descending=True)  # [batch_size, max_nodes]
+        
+        # Collect ALL nodes to complete (no grouping by timestep - we'll denoise simultaneously!)
+        nodes_to_complete = []  # List of (batch_idx, node_idx, initial_timestep, Q_value)
+        
+        for b in range(batch_size):
+            needed = self.test_num_samples - sample_molecule_count[b]
+            if needed <= 0:
+                continue
             
-            # Step 3: If not enough terminal nodes, complete top non-terminal nodes
-            if sample_molecule_count[b] < self.test_num_samples and nonterminal_indices:
-                # For non-terminals, use Q-values to select which nodes are worth completing
-                # Q-value estimates the expected quality if we complete this path
-                nonterminal_with_q = []
-                for n in nonterminal_indices:
-                    visits = tree.node_visits[b, n].item()
-                    if visits > 0:
-                        Q = tree.node_values[b, n].item()  / visits # Q-value (propagated through path)
-                        nonterminal_with_q.append((n, Q))
+            num_nonterminals = is_nonterminal_valid[b].sum().item()
+            if self.global_rank == 0 and b == 0:
+                logging.info(f"Sample {b}: Need {needed} more molecules, selecting from {num_nonterminals} non-terminal nodes")
+            
+            for rank in range(min(num_nonterminals, needed)):
+                n = sorted_nt_indices[b, rank].item()
+                Q = sorted_Q[b, rank].item()
                 
-                # Sort by Q descending (higher Q = more promising to complete)
-                nonterminal_with_q.sort(key=lambda x: x[1], reverse=True)
+                if Q == float('-inf'):  # No more valid non-terminal nodes
+                    break
                 
-                needed = self.test_num_samples - sample_molecule_count[b]
-                if self.global_rank == 0 and b == 0:
-                    logging.info(f"Sample {b}: Need {needed} more molecules, completing top {len(nonterminal_with_q)} non-terminal nodes")
+                t_cur = tree.node_timesteps_int[b, n].item()
+                nodes_to_complete.append((b, n, t_cur, Q))
+        
+        if self.global_rank == 0 and len(nodes_to_complete) > 0:
+            max_t = max(item[2] for item in nodes_to_complete)
+            logging.info(f"Completing {len(nodes_to_complete)} non-terminal nodes via SIMULTANEOUS MASKED DENOISING (max_t={max_t})")
+        
+        # ============ SIMULTANEOUS BATCHED DENOISING WITH DYNAMIC MASKING ============
+        # Key idea: Denoise ALL nodes together, use dynamic mask to control which nodes step at each iteration
+        # Each node has its own current timestep, and we decrement it as we denoise
+        if len(nodes_to_complete) > 0:
+            num_nodes_to_complete = len(nodes_to_complete)
+            b_indices = [item[0] for item in nodes_to_complete]
+            n_indices = [item[1] for item in nodes_to_complete]
+            initial_timesteps = torch.tensor([item[2] for item in nodes_to_complete], device=device, dtype=torch.int32)
+            
+            # Gather all states at once: [num_nodes_to_complete, n_atoms, ...]
+            X_all = torch.stack([tree.node_states_X[b, n] for b, n in zip(b_indices, n_indices)])
+            E_all = torch.stack([tree.node_states_E[b, n] for b, n in zip(b_indices, n_indices)])
+            y_all = torch.stack([tree.node_states_y[b, n] for b, n in zip(b_indices, n_indices)])
+            mask_all = torch.stack([tree.node_masks[b, n] for b, n in zip(b_indices, n_indices)])
+            
+            # Track current timestep for each node: [num_nodes_to_complete]
+            current_timesteps = initial_timesteps.clone()
+            max_timestep = initial_timesteps.max().item()
+            
+            # Denoise iteratively: at each iteration, denoise nodes that still need denoising
+            # Continue until all nodes reach t=0
+            while current_timesteps.max().item() > 0:
+                # Create active mask: which nodes still need denoising (current_timestep > 0)
+                active_mask = current_timesteps > 0  # [num_nodes_to_complete]
                 
-                # Complete each non-terminal node to terminal
-                for idx, (n, Q) in enumerate(nonterminal_with_q):
-                    if sample_molecule_count[b] >= self.test_num_samples:
-                        break
-                    
-                    # Get current state
-                    X_cur = tree.node_states_X[b, n]
-                    E_cur = tree.node_states_E[b, n]
-                    y_cur = tree.node_states_y[b, n]
-                    mask_cur = tree.node_masks[b, n]
-                    t_cur = tree.node_timesteps_int[b, n].item()
-                    
-                    if self.global_rank == 0 and b == 0 and idx % 10 == 0:
-                        logging.info(f"Sample {b}: Completing non-terminal node {idx+1}/{len(nonterminal_with_q)}, t={t_cur}, Q={Q:.4f}")
-                    
-                    # Denoise down to t=0
-                    for s_int in reversed(range(0, t_cur)):
-                        # Log progress for long denoising sequences
-                        if self.global_rank == 0 and b == 0 and idx == 0 and s_int % 20 == 0:
-                            logging.info(f"  Denoising step {t_cur - s_int}/{t_cur}")
-                        
-                        s_arr = torch.tensor([[s_int]], dtype=torch.float32, device=device) / self.T
-                        t_arr = torch.tensor([[s_int + 1]], dtype=torch.float32, device=device) / self.T
-                        
-                        X_batch = X_cur.unsqueeze(0)
-                        E_batch = E_cur.unsqueeze(0)
-                        y_batch = y_cur.unsqueeze(0)
-                        mask_batch = mask_cur.unsqueeze(0)
-                        
-                        sampled_s, _ = self.sample_p_zs_given_zt(s_arr, t_arr, X_batch, E_batch, y_batch, mask_batch)
-                        E_cur = sampled_s.E.squeeze(0)
-                    
-                    # Final molecule
-                    sampled_placeholder = utils.PlaceHolder(
-                        X=X_cur.unsqueeze(0), 
-                        E=E_cur.unsqueeze(0), 
-                        y=y_cur.unsqueeze(0)
-                    )
-                    sampled_placeholder = sampled_placeholder.mask(mask_cur.unsqueeze(0), collapse=True)
-                    X_collapsed = sampled_placeholder.X.squeeze(0).cpu().numpy()
-                    E_collapsed = sampled_placeholder.E.squeeze(0).cpu().numpy()
-                    
-                    valid, smi, mol = self._terminal_check_and_smiles(X_collapsed, E_collapsed)
-                    # if not valid or smi in sample_seen_smiles[b]:
-                    #     if self.global_rank == 0 and b == 0:
-                    #         logging.info(f"  Skipping invalid/duplicate molecule")
-                    #     continue
-                    
-                    # Add to batch collection
-                    all_mols.append(mol)
-                    all_smis.append(smi)
-                    all_precursor_mzs.append(env_metas[b]['precursor_mz'])
-                    all_adducts.append(env_metas[b]['adduct'])
-                    all_instruments.append(env_metas[b]['instrument'])
-                    all_collision_engs.append(env_metas[b]['collision_eng'])
-                    all_target_specs.append(spectra[b])
-                    sample_mol_map.append((b, sample_molecule_count[b]))
-                    
-                    sample_seen_smiles[b].add(smi)
-                    sample_molecule_count[b] += 1
+                if not active_mask.any():
+                    break
+                
+                num_active = active_mask.sum().item()
+                if self.global_rank == 0 and current_timesteps.max().item() % 20 == 0:
+                    avg_t = current_timesteps[active_mask].float().mean().item()
+                    logging.info(f"  Denoising: {num_active}/{num_nodes_to_complete} nodes active (avg_t={avg_t:.1f})")
+                
+                # Prepare per-node timesteps for denoising
+                # For each active node at timestep t_cur, denoise from t_cur to t_cur-1
+                # s_arr[i] = (current_timesteps[i] - 1) / T
+                # t_arr[i] = current_timesteps[i] / T
+                
+                # For inactive nodes (already at t=0), set s=t=0 (no-op, but keeps batch structure)
+                s_int_per_node = torch.clamp(current_timesteps - 1, min=0)  # [num_nodes_to_complete]
+                t_int_per_node = current_timesteps  # [num_nodes_to_complete]
+                
+                s_arr = (s_int_per_node.float() / self.T).unsqueeze(1)  # [num_nodes_to_complete, 1]
+                t_arr = (t_int_per_node.float() / self.T).unsqueeze(1)  # [num_nodes_to_complete, 1]
+                
+                # Batched denoising: ALL nodes denoised together with their individual timesteps
+                sampled_s, _ = self.sample_p_zs_given_zt(s_arr, t_arr, X_all, E_all, y_all, mask_all)
+                
+                # Update ONLY active nodes using the mask
+                # For inactive nodes (already at t=0), keep their current state
+                active_mask_expanded = active_mask.view(-1, 1, 1, 1)  # [num_nodes_to_complete, 1, 1, 1]
+                E_all = torch.where(active_mask_expanded, sampled_s.E, E_all)
+                
+                # Decrement timesteps for active nodes
+                current_timesteps = torch.where(active_mask, current_timesteps - 1, current_timesteps)
+            
+            # Process all completed molecules
+            for idx, (b, n, t_init, Q) in enumerate(nodes_to_complete):
+                if sample_molecule_count[b] >= self.test_num_samples:
+                    continue
+                
+                # Get final state
+                X_final = X_all[idx]
+                E_final = E_all[idx]
+                y_final = y_all[idx]
+                mask_final = mask_all[idx]
+                
+                # Collapse to molecule
+                sampled_placeholder = utils.PlaceHolder(
+                    X=X_final.unsqueeze(0), 
+                    E=E_final.unsqueeze(0), 
+                    y=y_final.unsqueeze(0)
+                )
+                sampled_placeholder = sampled_placeholder.mask(mask_final.unsqueeze(0), collapse=True)
+                X_collapsed = sampled_placeholder.X.squeeze(0).cpu().numpy()
+                E_collapsed = sampled_placeholder.E.squeeze(0).cpu().numpy()
+                
+                valid, smi, mol = self._terminal_check_and_smiles(X_collapsed, E_collapsed)
+                
+                # Add to batch collection
+                all_mols.append(mol)
+                all_smis.append(smi)
+                all_precursor_mzs.append(env_metas[b]['precursor_mz'])
+                all_adducts.append(env_metas[b]['adduct'])
+                all_instruments.append(env_metas[b]['instrument'])
+                all_collision_engs.append(env_metas[b]['collision_eng'])
+                all_target_specs.append(spectra[b])
+                sample_mol_map.append((b, sample_molecule_count[b]))
+                
+                sample_seen_smiles[b].add(smi)
+                sample_molecule_count[b] += 1
         
         # Phase 2: BATCH SCORE ALL MOLECULES AT ONCE
         # This is the key optimization: one verifier call instead of hundreds/thousands
-        # all_scores = []
-        # if len(all_mols) > 0:
-        #     self._ensure_verifier()
-        #     all_scores = self.verifier.score_batch(
-        #         all_mols, all_smis,
-        #         all_precursor_mzs, all_adducts,
-        #         all_instruments, all_collision_engs,
-        #         all_target_specs
-        #     )
+        all_scores = []
+        if len(all_mols) > 0:
+            self._ensure_verifier()
+            all_scores = self.verifier.score_batch(
+                all_mols, all_smis,
+                all_precursor_mzs, all_adducts,
+                all_instruments, all_collision_engs,
+                all_target_specs
+            )
         
         # Phase 3: Scatter scores back to per-sample results
         # Build results structure: List[List[Tuple[str, float, mol]]]
         results = [[] for _ in range(batch_size)]
         for idx, (sample_idx, local_idx) in enumerate(sample_mol_map):
-            # score = float(all_scores[idx])
-            score = 0.0
+            score = float(all_scores[idx])
             results[sample_idx].append((all_smis[idx], score, all_mols[idx]))
         
         return results
@@ -1148,6 +1204,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         # Prepare s_norm and t_norm for denoising
         # For child at timestep t', denoising uses s'=(t'-1)/T, t'=(t')/T
         # Shape: [B*K, 1]
+        next_leaf_t_norm = (expanded_t_int.float() / self.T).unsqueeze(1)  # [B*K, 1]
         next_t_norm = (next_t_int.float() / self.T).unsqueeze(1)  # [B*K, 1]
         next_s_norm = ((next_t_int.float() - 1).clamp(min=0) / self.T).unsqueeze(1)  # [B*K, 1]
         
@@ -1155,7 +1212,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         # sample_p_zs_given_zt handles batch dimension automatically
         # Input: [B*K, ...], Output: [B*K, ...]
         sampled_states, _ = self.sample_p_zs_given_zt(
-            next_s_norm, next_t_norm, expanded_X, expanded_E, expanded_y, expanded_mask
+            next_t_norm, next_leaf_t_norm, expanded_X, expanded_E, expanded_y, expanded_mask
         )
         
         # Extract sampled edges (edge-only denoising: keep X unchanged)
@@ -1354,7 +1411,12 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             for i, idx in enumerate(valid_indices):
                 scores[idx] = batch_scores_tensor[i]
         
-        # Reshape to original shape
+        # Store scores in node_rewards BEFORE reshaping (while still flat)
+        # tree.node_rewards is [batch_size, max_nodes]
+        # batch_indices is [N], node_indices_flat is [N], scores is [N]
+        tree.node_rewards[batch_indices, node_indices_flat] = scores.clone()
+        
+        # Reshape to original shape for return value
         scores = scores.view(original_shape)
         
         return scores
@@ -1420,9 +1482,12 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 tree.node_visits[b, n] = new_visits
                 
                 # Update value: V = (V * (N-1) + r) / N (running average)
+                reward = current_values[i].item()
                 old_value = tree.node_values[b, n].item()
-                new_value = old_value + current_values[i].item()
+                new_value = old_value + reward
                 tree.node_values[b, n] = new_value
+                if tree.node_rewards[b, n] > reward and depth == 1:
+                    logging.info(f"parent reward {tree.node_rewards[b, n]}, child reward {reward}")
             
             # Move to parents
             new_nodes = torch.zeros_like(current_nodes)
