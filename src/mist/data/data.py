@@ -6,7 +6,7 @@ import re
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 
-from mist import utils
+from .. import utils  # Changed from 'from mist import utils' for multiprocessing compatibility
 
 
 class Spectra(object):

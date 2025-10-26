@@ -14,7 +14,7 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from mist import utils
+from .. import utils  # Changed from 'from mist import utils' for multiprocessing compatibility
 from . import featurizers
 from .data import Spectra, Mol
 
