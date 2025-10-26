@@ -14,6 +14,7 @@ iceberg:
 
 similarity:
   tolerance_da: 0.01
+  bin_size: 1.0
 
 bins_upper_mz: 1500.0
 bins_count: 15000
