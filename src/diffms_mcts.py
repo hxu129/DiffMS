@@ -1571,8 +1571,8 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 old_value = tree.node_values[b, n].item()
                 new_value = old_value + reward
                 tree.node_values[b, n] = new_value
-                if tree.node_rewards[b, n] > reward and depth == 1:
-                    logging.info(f"parent reward {tree.node_rewards[b, n]}, child reward {reward}")
+                # if tree.node_rewards[b, n] > reward and depth == 1:
+                #     logging.info(f"parent reward {tree.node_rewards[b, n]}, child reward {reward}")
             
             # Move to parents
             new_nodes = torch.zeros_like(current_nodes)
