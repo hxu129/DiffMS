@@ -195,7 +195,7 @@ class IcebergVerifier(BaseVerifier):
 
         return np.array(merged, dtype=float)
 
-    def bin_spectra(self, spec: Spectrum, mz_min: int = 0, mz_max: int = 1000, bin_size: float = 5.0):
+    def bin_spectra(self, spec: Spectrum, mz_min: int = 0, mz_max: int = 1000, bin_size: float = 10.0):
         """
         Bin spectrum to a common grid for consistent comparison.
         
@@ -277,7 +277,8 @@ class IcebergVerifier(BaseVerifier):
         """
         Batched version of score() that processes multiple molecules simultaneously.
         
-        Key optimization: Batch ICEBERG forward passes for all molecules at once.
+        Key optimization: Batch ICEBERG intensity prediction for all molecules at once.
+        Tree generation is sequential (autoregressive), but intensity prediction is batched.
         
         Args:
             mol_list: List of RDKit molecules to evaluate
@@ -294,22 +295,87 @@ class IcebergVerifier(BaseVerifier):
         if len(mol_list) == 0:
             return []
         
-        scores = []
+        n_mols = len(mol_list)
+        scores = [0.0] * n_mols
         
-        # Process each molecule (ICEBERG batching would require model modifications)
-        # For now, we batch at a higher level (in _batched_evaluate)
-        # but we can still optimize by avoiding repeated tensor allocations
-        for i, (mol, smi, prec_mz, adduct, instrument, coll_eng, target_spec) in enumerate(
-            zip(mol_list, smiles_list, precursor_mzs, adducts, instruments, collision_engs, target_spectra_list)
+        # try:
+        # Canonicalize SMILES for consistency with sequential method
+        canonical_smiles = [Chem.MolToSmiles(mol, canonical=True) for mol in mol_list]
+            
+        # Step 1: Batch predict spectra for all molecules
+        # This batches the GPU-intensive intensity prediction
+        batch_outputs = self.joint_model.predict_mol_batch(
+            mol_list=mol_list,
+            smi_list=canonical_smiles,
+            adduct_list=adducts,
+            threshold=0,
+            device=self.device,
+            max_nodes=100,
+            binned_out=False,
+        )
+            
+        # Step 2: Process each prediction and compute similarity
+        for i, (output, smi, mol, adduct, prec_mz, target_spec) in enumerate(
+            zip(batch_outputs, smiles_list, mol_list, adducts, precursor_mzs, target_spectra_list)
         ):
-            # Call original score method for each molecule
-            # Note: This is a single molecule, so we pass it directly
             try:
-                score_list = self.score([mol], [smi], prec_mz, adduct, instrument, coll_eng, target_spec)
+                # Aggregate fragments to spectrum
+                frags = output.get('frags', {})
+                frag_spectrum = self._aggregate_fragments_to_spectrum(frags)
+                    
+                # Apply same processing as sequential: weight by molecular weight and normalize
+                # (Even though we have single molecule, this ensures consistency with sequential code)
+                # mw = Descriptors.MolWt(mol) if mol is not None else 1.0
+                # specs_and_weights = [(frag_spectrum, mw)]
+                # pred_spectrum = self._combine_spectra_weighted(specs_and_weights)
+                pred_spectrum = frag_spectrum
+                    
+                # Convert target to matchms Spectrum
+                spec_t = self._to_matchms(target_spec, adduct, prec_mz)
+                    
+                # Convert prediction to matchms Spectrum and compute similarity
+                if pred_spectrum.shape[0] > 0 and pred_spectrum[:, 1].sum() > 0:
+                    pred_metadata = {'adduct': adduct}
+                    if prec_mz is not None and prec_mz > 0:
+                        pred_metadata['precursor_mz'] = float(prec_mz)
+                        
+                    spec_p = Spectrum(
+                        mz=pred_spectrum[:, 0].astype(float),
+                        intensities=pred_spectrum[:, 1].astype(float),
+                        metadata=pred_metadata
+                    )
+                        
+                    # Bin to common grid for fair comparison
+                    spec_p = self.bin_spectra(spec_p)
+                    spec_t = self.bin_spectra(spec_t)
+                        
+                    result = self.cosine.pair(query=spec_p, reference=spec_t)
+                    s = result['score']
+                    scores[i] = s if s is not None else 0.0
+                    # logging.info(f"Batched cosine score for: {scores[i]:.4f}")
+                else:
+                    scores[i] = 0.0
+                    logging.warning(f"Empty spectrum for {smi}, score=0.0")
+                        
             except Exception as e:
-                logging.error(f"Error processing molecule {smi}: {e}")
-                score_list = [0.0]
-            scores.append(score_list[0])
+                logging.error(f"Error processing molecule {smi} in batch: {e}")
+                scores[i] = 0.0
+                    
+        # # except Exception as e:
+        #     # If batch processing fails entirely, fall back to sequential
+        #     alt_scores = []
+        #     # logging.error(f"Batch processing failed, falling back to sequential: {e}")
+        #     for i, (mol, smi, prec_mz, adduct, instrument, coll_eng, target_spec) in enumerate(
+        #         zip(mol_list, smiles_list, precursor_mzs, adducts, instruments, collision_engs, target_spectra_list)
+        #     ):
+        #         try:
+        #             score_list = self.score([mol], [smi], prec_mz, adduct, instrument, coll_eng, target_spec)
+        #             alt_scores.append(score_list[0])
+        #         except Exception as e:
+        #             logging.error(f"Error processing molecule {smi}: {e}")
+        #             alt_scores.append(0.0)
+        #     logging.info(f"difference between batch and sequential scores: {(np.array(scores) - np.array(alt_scores))}")
+        # NOTE: here there might be error between cpu version and batched version, and it is about e-2 (very few cases)to e-6
         
         return scores
     
