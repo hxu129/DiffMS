@@ -536,8 +536,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             # 3. Evaluation: score all new children (batched verifier call)
             # Input: [batch_size, K] node indices
             # Output: [batch_size, K] scores
+            # current_time = time.time()
             child_scores = self._batched_evaluate(tree, new_child_indices, env_metas, spectra)
-            
+            # logging.info(f"Time taken for scoring: {time.time() - current_time} seconds")
             # 4. Backup: propagate scores up to root
             # Input: [batch_size, K] node indices and scores
             tree = self._batched_backup(tree, new_child_indices, child_scores)
