@@ -1475,11 +1475,13 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             # Call verifier with all molecules at once (batched ICEBERG)
             # This is the key optimization: one verifier call instead of N calls
             self._ensure_verifier()
+            current_time = time.time()
             batch_scores = self.verifier.score_batch(
                 mols_to_eval, smis_to_eval,
                 precursor_mzs, adducts, instruments, collision_engs, target_specs
             )
-            
+            logging.info(f"Time taken for scoring: {time.time() - current_time} seconds")
+
             # Convert to tensor if needed (verifier may return numpy array or list)
             if isinstance(batch_scores, torch.Tensor):
                 batch_scores_tensor = batch_scores.to(device=device, dtype=torch.float32)
