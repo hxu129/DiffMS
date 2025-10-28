@@ -138,7 +138,7 @@ def _worker_predict_and_score_spectrum(args):
     try:
         # predict_mol is a method of the JointModel class
         smi = Chem.MolToSmiles(mol, canonical=True)
-        if smi in _worker_cache:
+        if smi+adduct in _worker_cache:
             p_spec = _worker_cache[smi+adduct]
         else:
             output = _worker_joint_model.predict_mol(
