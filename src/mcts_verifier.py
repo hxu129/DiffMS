@@ -1,7 +1,19 @@
+import os
+os.environ['RDKIT_CATCH_WARNINGS'] = '0'
+import sys
+if 'rdkit' not in sys.modules:
+    # RDKit not loaded yet - good, suppress before loading
+    from rdkit import RDLogger
+    RDLogger.logger().setLevel(RDLogger.CRITICAL)
+    for level in ['rdApp', 'rdApp.info', 'rdApp.warning', 'rdApp.error',
+                  'rdMol', 'rdSanit', 'rdGeneral']:
+        RDLogger.DisableLog(level)
+
 import numpy as np
 import torch
 from rdkit import Chem
 from typing import Union, Optional, List
+from collections import defaultdict
 from rdkit.Chem import Descriptors
 from matchms import Spectrum, similarity
 from collections import defaultdict, OrderedDict
@@ -9,7 +21,6 @@ import logging
 import multiprocessing as mp
 from functools import partial
 import time
-import os
 import warnings
 import logging
 
@@ -65,7 +76,8 @@ def _bin_and_score_vectorized(pred_spec: np.ndarray, target_spec: np.ndarray,
 def _init_worker(gen_checkpoint, inten_checkpoint, device):
     """Initialize worker with a complete JointModel."""
     global _worker_joint_model
-    
+    global _worker_cache
+
     # Suppress warnings in worker processes
     import warnings
     import os
@@ -95,6 +107,9 @@ def _init_worker(gen_checkpoint, inten_checkpoint, device):
     _worker_joint_model.eval()
     _worker_joint_model.to(device)
 
+    # setup cache
+    _worker_cache = defaultdict()
+
 @torch.no_grad()
 def _worker_predict_and_score_spectrum(args):
     """
@@ -116,21 +131,25 @@ def _worker_predict_and_score_spectrum(args):
     warnings.filterwarnings('ignore', category=DeprecationWarning)
 
     global _worker_joint_model
+    global _worker_cache
     mol, t_spec, adduct, device, bin_size = args
 
     # stage 1: predict the spectrum
     try:
         # predict_mol is a method of the JointModel class
         smi = Chem.MolToSmiles(mol, canonical=True)
-        output = _worker_joint_model.predict_mol(
-            mol=mol,
-            smi=smi,
-            adduct=adduct,
-            threshold=0.0,
-            device=device,
-            max_nodes=100,
-            binned_out=False,
-        )
+        if smi in _worker_cache:
+            p_spec = _worker_cache[smi+adduct]
+        else:
+            output = _worker_joint_model.predict_mol(
+                mol=mol,
+                smi=smi,
+                adduct=adduct,
+                threshold=0.0,
+                device=device,
+                max_nodes=100,
+                binned_out=False,
+            )
         
         # Aggregate fragments into a final spectrum array
         # This is the same logic you already have in _aggregate_fragments_to_spectrum
@@ -149,6 +168,8 @@ def _worker_predict_and_score_spectrum(args):
             p_spec = np.array([[0.0, 0.0]])
         else:
             p_spec = np.array(list(mass_to_inten.items()), dtype=float)
+
+        _worker_cache[smi+adduct] = p_spec
 
     except Exception as e:
         logging.error(f"Worker error on SMILES {smi}: {e}")
