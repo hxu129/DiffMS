@@ -3,7 +3,7 @@ import torch
 from rdkit import Chem
 from typing import Union, Optional, List
 from rdkit.Chem import Descriptors
-from matchms import Spectrum
+from matchms import Spectrum, similarity
 from collections import defaultdict, OrderedDict
 import logging
 import multiprocessing as mp
@@ -11,6 +11,7 @@ from functools import partial
 import time
 import os
 import warnings
+import logging
 
 # Disable RDKit warnings globally
 os.environ['RDKIT_CATCH_WARNINGS'] = '0'
@@ -25,16 +26,41 @@ RDLogger.DisableLog('rdGeneral')  # Disable general warnings
 warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message='.*non-writable.*')
 
-# External deps are imported inside methods to keep import-time light
-
 # Global worker state (initialized once per worker process)
 _worker_gen_model = None
 _worker_inten_tp = None
 
-# In mcts_verifier.py
-
 # Global worker state (initialized once per worker process)
 _worker_joint_model = None
+cosine = similarity.CosineGreedy(tolerance=0.01)
+def _bin_and_score_vectorized(pred_spec: np.ndarray, target_spec: np.ndarray, 
+                                mz_min: int = 0, mz_max: int = 1000, bin_size: float = 1.0) -> float:
+    """Single-pass binned cosine similarity - FASTEST version."""
+    # Create grid once
+    mz_grid = np.arange(mz_min, mz_max + bin_size, bin_size)
+    n_bins = len(mz_grid)
+    
+    # Bin both spectra simultaneously
+    def bin_spectrum(spec):
+        mz, inten = spec[:, 0], spec[:, 1]
+        bin_idx = np.clip(np.round((mz - mz_min) / bin_size).astype(int), 0, n_bins - 1)
+        binned = np.bincount(bin_idx, weights=inten, minlength=n_bins)
+        return binned
+    
+    query_binned = bin_spectrum(pred_spec)
+    ref_binned = bin_spectrum(target_spec)
+    
+    # Fast cosine similarity
+    dot = np.dot(query_binned, ref_binned)
+    norm_q = np.linalg.norm(query_binned)
+    norm_r = np.linalg.norm(ref_binned)
+    
+    if norm_q == 0 or norm_r == 0:
+        return 0.0
+    
+    cosine_score = dot / (norm_q * norm_r)
+
+    return cosine_score
 
 def _init_worker(gen_checkpoint, inten_checkpoint, device):
     """Initialize worker with a complete JointModel."""
@@ -69,29 +95,40 @@ def _init_worker(gen_checkpoint, inten_checkpoint, device):
     _worker_joint_model.eval()
     _worker_joint_model.to(device)
 
-def _worker_predict_spectrum(args):
+@torch.no_grad()
+def _worker_predict_and_score_spectrum(args):
     """
     Worker function that performs the ENTIRE prediction pipeline
     and returns only the final spectrum array.
     """
-    global _worker_joint_model
-    mol, smi, adduct, threshold, max_nodes, device = args
-
-    # Suppress warnings (re-applied in worker process)
+    # Suppress warnings in worker processes
     import warnings
+    import os
+    from rdkit import RDLogger
+    
+    os.environ['RDKIT_CATCH_WARNINGS'] = '0'
+    RDLogger.DisableLog('rdApp')  # Disable application-level logging
+    RDLogger.DisableLog('rdMol')  # Disable molecule warnings
+    RDLogger.DisableLog('rdSanit')  # Disable sanitization warnings
+    RDLogger.DisableLog('rdGeneral')  # Disable general warnings
     warnings.filterwarnings('ignore', message='.*non-writable.*')
     warnings.filterwarnings('ignore', category=UserWarning, module='dgl')
     warnings.filterwarnings('ignore', category=DeprecationWarning)
-    
+
+    global _worker_joint_model
+    mol, t_spec, adduct, device, bin_size = args
+
+    # stage 1: predict the spectrum
     try:
         # predict_mol is a method of the JointModel class
+        smi = Chem.MolToSmiles(mol, canonical=True)
         output = _worker_joint_model.predict_mol(
             mol=mol,
             smi=smi,
             adduct=adduct,
-            threshold=threshold,
+            threshold=0.0,
             device=device,
-            max_nodes=max_nodes,
+            max_nodes=100,
             binned_out=False,
         )
         
@@ -109,14 +146,22 @@ def _worker_predict_spectrum(args):
                     mass_to_inten[mz] += inten
         
         if not mass_to_inten:
-            return np.array([[0.0, 0.0]])
-            
-        return np.array(sorted(mass_to_inten.items()), dtype=float)
+            p_spec = np.array([[0.0, 0.0]])
+        else:
+            p_spec = np.array(list(mass_to_inten.items()), dtype=float)
 
     except Exception as e:
-        import logging
         logging.error(f"Worker error on SMILES {smi}: {e}")
-        return np.array([[0.0, 0.0]])
+        p_spec = np.array([[0.0, 0.0]])
+
+    # stage 2: score the spectrum
+    try:
+        score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, bin_size=bin_size)
+    except Exception as e:
+        logging.error(f"Worker error on scoring spectrum {smi}: {e}")
+        return 0.0
+    
+    return score
 
 class BaseVerifier:
     """Abstract verifier interface.
@@ -133,7 +178,6 @@ class BaseVerifier:
               collision_eng: Optional[float],
               target_spectra: np.ndarray) -> List[float]:
         raise NotImplementedError
-
 
 class IcebergVerifier(BaseVerifier):
     def __init__(self,
@@ -180,71 +224,6 @@ class IcebergVerifier(BaseVerifier):
             self.worker_pool.close()
             self.worker_pool.join()
 
-    def _to_matchms(self, spectra: np.ndarray, adduct: str, precursor_mz: float = None):
-        # Accept either binned vector (len==bins_count) or raw peaks (N,2)
-        arr = np.asarray(spectra)
-        if arr.ndim == 1 and arr.shape[0] == self.bins_count:
-            mz = np.linspace(0.0, self.bins_upper_mz, self.bins_count)
-            inten = arr
-        elif arr.ndim == 2 and arr.shape[1] == 2:
-            mz, inten = arr[:, 0], arr[:, 1]
-        else:
-            raise ValueError("target_spectra must be 1D binned (length bins_count) or 2D (N,2) peaks array")
-        
-        metadata = {'adduct': adduct}
-        if precursor_mz is not None and precursor_mz > 0:
-            metadata['precursor_mz'] = float(precursor_mz)
-        
-        # Sort by m/z (matchms requires sorted mz values)
-        sort_idx = np.argsort(mz)
-        mz_sorted = mz[sort_idx]
-        inten_sorted = inten[sort_idx]
-        
-        return Spectrum(mz=mz_sorted.astype(float), intensities=inten_sorted.astype(float), metadata=metadata)
-    
-    def bin_spectra(self, spec: Spectrum, mz_min: int = 0, mz_max: int = 1000, bin_size: float = 10.0):
-        """
-        Bin spectrum to a common grid for consistent comparison.
-        
-        Args:
-            spec: matchms Spectrum object
-            mz_min: minimum m/z value (default: 0)
-            mz_max: maximum m/z value (default: 1000) 
-            bin_size: bin size in m/z units (default: 1.0)
-            
-        Returns:
-            tuple: (mz_grid, binned_intensities)
-        """
-        # Create common m/z grid
-        mz_grid = np.arange(mz_min, mz_max + bin_size, bin_size)
-        binned_intensities = np.zeros(len(mz_grid))
-        
-        if spec is None or len(spec.peaks.mz) == 0:
-            return mz_grid, binned_intensities
-            
-        # Get spectrum data
-        mz_values = spec.peaks.mz
-        intensities = spec.peaks.intensities
-        
-        # Bin each peak to the nearest grid point
-        for mz, intensity in zip(mz_values, intensities):
-            # Find the closest bin index
-            bin_idx = np.round((mz - mz_min) / bin_size).astype(int)
-            
-            # Check if within bounds
-            if bin_idx < 0:
-                binned_intensities[0] += intensity
-            elif bin_idx < len(mz_grid):
-                # Add intensity to the bin (sum if multiple peaks fall in same bin)
-                binned_intensities[bin_idx] += intensity
-            else:
-                binned_intensities[-1] += intensity
-                
-        metadata = spec.metadata
-        new_spec = Spectrum(mz=mz_grid, intensities=binned_intensities, metadata=metadata)
-                
-        return new_spec
-
     @torch.no_grad()
     def score_batch(self,
                    mol_list: List[Chem.Mol],
@@ -259,47 +238,19 @@ class IcebergVerifier(BaseVerifier):
         if not mol_list:
             return []
         
-        canonical_smiles = [Chem.MolToSmiles(mol, canonical=True) for mol in mol_list]
         worker_device = 'cpu'  # Matching the device used in the initializer
+        bin_size = float(bin_size)
 
         worker_args = [
-            (mol, smi, adduct, 0, 100, worker_device)  # threshold=0, max_nodes=100
-            for mol, smi, adduct in zip(mol_list, canonical_smiles, adducts)
+            (mol, t_spec, adduct, worker_device, bin_size)
+            for mol, t_spec, adduct in zip(mol_list, target_spectra_list, adducts)
         ]
 
-        # This now returns a list of simple NumPy arrays
+        # This now returns a list of scores
         current_time = time.time()
-        predicted_spectra_list = self.worker_pool.map(_worker_predict_spectrum, worker_args)
-        logging.info(f"Time taken for predicting spectra: {time.time() - current_time} seconds")
+        scores = self.worker_pool.map(_worker_predict_and_score_spectrum, worker_args)
+        logging.info(f"Time taken for predicting and scoring spectra: {time.time() - current_time} seconds")
 
-        scores = []
-        for i, pred_spectrum in enumerate(predicted_spectra_list):
-            try:
-                target_spec = target_spectra_list[i]
-                adduct = adducts[i]
-                prec_mz = precursor_mzs[i]
-
-                spec_t = self._to_matchms(target_spec, adduct, prec_mz)
-
-                if pred_spectrum.shape[0] > 0 and pred_spectrum[:, 1].sum() > 0:
-                    spec_p = Spectrum(
-                        mz=pred_spectrum[:, 0].astype(float),
-                        intensities=pred_spectrum[:, 1].astype(float),
-                        metadata={'adduct': adduct, 'precursor_mz': float(prec_mz)}
-                    )
-                    
-                    # Bin and score
-                    spec_p_binned = self.bin_spectra(spec_p, bin_size=bin_size)
-                    spec_t_binned = self.bin_spectra(spec_t, bin_size=bin_size)
-                    
-                    result = self.cosine.pair(query=spec_p_binned, reference=spec_t_binned)
-                    scores.append(result['score'] if result['score'] is not None else 0.0)
-                else:
-                    scores.append(0.0)
-            except Exception as e:
-                logging.error(f"Error in scoring molecule {smiles_list[i]}: {e}")
-                scores.append(0.0)
-        
         return scores
 
 def build_verifier(cfg) -> BaseVerifier:
