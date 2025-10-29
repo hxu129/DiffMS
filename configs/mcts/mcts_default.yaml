@@ -19,3 +19,5 @@ similarity:
 bins_upper_mz: 1500.0
 bins_count: 15000
 
+num_workers: 16
+
