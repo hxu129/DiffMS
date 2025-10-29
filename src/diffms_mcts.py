@@ -551,6 +551,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         
         return results
     
+    @torch.no_grad()
     def _extract_batched_results(
         self,
         tree: BatchedMctsTree,
@@ -757,9 +758,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                         break
                     
                     num_active = active_mask.sum().item()
-                    if self.global_rank == 0 and chunk_start == 0 and current_timesteps.max().item() % 20 == 0:
+                    if self.global_rank == 0 and current_timesteps.max().item() % 20 == 0:
                         avg_t = current_timesteps[active_mask].float().mean().item()
-                        logging.info(f"  Chunk 0 Denoising: {num_active}/{chunk_size_actual} nodes active (avg_t={avg_t:.1f})")
+                        logging.info(f"Chunk {chunk_start} Denoising: {num_active}/{chunk_size_actual} nodes active (avg_t={avg_t:.1f})")
                     
                     # For inactive nodes (already at t=0), set s=t=0 (no-op, but keeps batch structure)
                     s_int_per_node = torch.clamp(current_timesteps - 1, min=0)  # [chunk_size]
@@ -1031,6 +1032,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             best_smiles=best_smiles
         )
     
+    @torch.no_grad()
     def _batched_prediffuse(self, tree: BatchedMctsTree, t_thresh: int) -> BatchedMctsTree:
         """
         Pre-diffuse root states from T down to t_thresh using batched denoising.
@@ -1080,6 +1082,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         
         return tree
     
+    @torch.no_grad()
     def _batched_select(self, tree: BatchedMctsTree, c_puct: float) -> torch.Tensor:
         """
         Traverse tree from root using UCT until finding nodes ready for expansion.
@@ -1219,6 +1222,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         
         return current_nodes
     
+    @torch.no_grad()
     def _batched_expand(self, tree: BatchedMctsTree, leaf_indices: torch.Tensor, K: int) -> Tuple[BatchedMctsTree, torch.Tensor]:
         """
         Expand K children for selected leaves in parallel across batch.
@@ -1338,6 +1342,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         
         return tree, new_child_indices
     
+    @torch.no_grad()
     def _batched_evaluate(
         self,
         tree: BatchedMctsTree,
