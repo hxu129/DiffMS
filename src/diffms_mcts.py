@@ -1473,13 +1473,28 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             target_specs = [spectra[sample_indices[idx].item()] for idx in valid_indices]
             
             # Call verifier with all molecules at once (batched ICEBERG)
+            # In _batched_evaluate, deduplicate before scoring
             # This is the key optimization: one verifier call instead of N calls
             self._ensure_verifier()
             current_time = time.time()
-            batch_scores = self.verifier.score_batch(
-                mols_to_eval, smis_to_eval,
-                precursor_mzs, adducts, instruments, collision_engs, target_specs
-            )
+            unique_smiles = {}
+            from collections import defaultdict
+            mol_indices_map = defaultdict(list)
+
+            for i, (mol, smi) in enumerate(zip(mol_list, smi_list)):
+                if smi not in unique_smiles:
+                    unique_smiles[smi] = (mol, smi, precursor_mzs[i], adducts[i], instruments[i], collision_engs[i], target_specs[i])
+                mol_indices_map[smi].append(i)
+
+            # Score only unique SMILES
+            unique_scores = self.verifier.score_batch(*zip(*list(unique_smiles.values())), bin_size=self.cfg.mcts.similarity.bin_size)
+
+            # Remap scores to original indices
+            batch_scores = torch.zeros(N, device=device)
+            for smi, score in zip(unique_smiles.keys(), unique_scores):
+                for original_idx in mol_indices_map[smi]:
+                    batch_scores[original_idx] = score
+
             logging.info(f"Time taken for scoring: {time.time() - current_time} seconds")
 
             # Convert to tensor if needed (verifier may return numpy array or list)
