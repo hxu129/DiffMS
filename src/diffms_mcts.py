@@ -644,8 +644,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                     break
                 
                 # Get final molecule state
-                X_t = tree.node_states_X[b, n]
-                E_t = tree.node_states_E[b, n]
+                X_t_indices = tree.node_states_X[b, n]
+                X_t = F.one_hot(X_t_indices.long(), num_classes=self.Xdim_output).float()  # [B, n_atoms, X_dim]
+                E_t_indices = tree.node_states_E[b, n]
+                E_t = F.one_hot(E_t_indices.long(), num_classes=self.Edim_output).float()  # [B, n_atoms, n_atoms, E_dim]
                 mask_t = tree.node_masks[b, n]
                 
                 # Collapse one-hot to indices
@@ -736,8 +738,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 initial_timesteps = torch.tensor([item[2] for item in chunk], device=device, dtype=torch.int32)
                 
                 # Gather states for this chunk: [chunk_size, n_atoms, ...]
-                X_all = torch.stack([tree.node_states_X[b, n] for b, n in zip(b_indices, n_indices)])
-                E_all = torch.stack([tree.node_states_E[b, n] for b, n in zip(b_indices, n_indices)])
+                X_all_indices = torch.stack([tree.node_states_X[b, n] for b, n in zip(b_indices, n_indices)])
+                X_all = F.one_hot(X_all_indices.long(), num_classes=self.Xdim_output).float()  # [chunk_size, n_atoms, X_dim]
+                E_all_indices = torch.stack([tree.node_states_E[b, n] for b, n in zip(b_indices, n_indices)])
+                E_all = F.one_hot(E_all_indices.long(), num_classes=self.Edim_output).float()  # [chunk_size, n_atoms, n_atoms, E_dim]
                 y_all = torch.stack([tree.node_states_y[b, n] for b, n in zip(b_indices, n_indices)])
                 mask_all = torch.stack([tree.node_masks[b, n] for b, n in zip(b_indices, n_indices)])
                 
@@ -979,8 +983,8 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         children_values = torch.zeros(batch_size, max_nodes, branch_k, device=device, dtype=torch.float32)
         
         # State embeddings: [batch_size, max_nodes, ...]
-        node_states_X = torch.zeros(batch_size, max_nodes, n_atoms, X_dim, device=device, dtype=torch.float32)
-        node_states_E = torch.zeros(batch_size, max_nodes, n_atoms, n_atoms, E_dim, device=device, dtype=torch.float32)
+        node_states_X = torch.zeros(batch_size, max_nodes, n_atoms, device=device, dtype=torch.uint8)
+        node_states_E = torch.zeros(batch_size, max_nodes, n_atoms, n_atoms, device=device, dtype=torch.uint8)
         node_states_y = torch.zeros(batch_size, max_nodes, y_dim, device=device, dtype=torch.float32)
         node_masks = torch.zeros(batch_size, max_nodes, n_atoms, device=device, dtype=torch.bool)
         
@@ -998,8 +1002,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         best_smiles = [[] for _ in range(batch_size)]
         
         # Initialize root nodes (index 0) with starting states
-        node_states_X[:, 0] = X_init
-        node_states_E[:, 0] = E_init
+       # Initialize root nodes (index 0) with starting states
+        node_states_X[:, 0] = X_init.argmax(dim=-1).to(torch.uint8)
+        node_states_E[:, 0] = E_init.argmax(dim=-1).to(torch.uint8)
         node_states_y[:, 0] = y_init
         node_masks[:, 0] = node_mask
         
@@ -1054,8 +1059,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         device = tree.node_visits.device
         
         # Get root states: [batch_size, n_atoms, ...]
-        X_cur = tree.node_states_X[:, BatchedMctsTree.ROOT_INDEX]  # [B, n_atoms, X_dim]
-        E_cur = tree.node_states_E[:, BatchedMctsTree.ROOT_INDEX]  # [B, n_atoms, n_atoms, E_dim]
+        X_cur_indices = tree.node_states_X[:, BatchedMctsTree.ROOT_INDEX]  # [B, n_atoms]
+        X_cur = F.one_hot(X_cur_indices.long(), num_classes=self.Xdim_output).float()  # [B, n_atoms, X_dim]
+        E_cur_indices = tree.node_states_E[:, BatchedMctsTree.ROOT_INDEX]  # [B, n_atoms, n_atoms]
+        E_cur = F.one_hot(E_cur_indices.long(), num_classes=self.Edim_output).float()  # [B, n_atoms, n_atoms, E_dim]
         y_cur = tree.node_states_y[:, BatchedMctsTree.ROOT_INDEX]  # [B, y_dim]
         mask_cur = tree.node_masks[:, BatchedMctsTree.ROOT_INDEX]  # [B, n_atoms]
         
@@ -1074,7 +1081,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             E_cur = sampled_s.E
         
         # Update root states in tree
-        tree.node_states_E[:, BatchedMctsTree.ROOT_INDEX] = E_cur
+        tree.node_states_E[:, BatchedMctsTree.ROOT_INDEX] = E_cur.argmax(dim=-1).to(torch.uint8)
         tree.node_timesteps_int[:, BatchedMctsTree.ROOT_INDEX] = t_thresh
         tree.node_timesteps_norm[:, BatchedMctsTree.ROOT_INDEX] = t_thresh / self.T
         tree.node_s_norm[:, BatchedMctsTree.ROOT_INDEX] = (t_thresh - 1) / self.T
@@ -1272,8 +1279,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         
         # Gather states from leaves to expand
         # Shape: [batch_size, n_atoms, ...]
-        leaf_X = tree.node_states_X[batch_range, leaf_indices]  # [B, n_atoms, X_dim]
-        leaf_E = tree.node_states_E[batch_range, leaf_indices]  # [B, n_atoms, n_atoms, E_dim]
+        leaf_X_indices = tree.node_states_X[batch_range, leaf_indices]  # [B, n_atoms, X_dim]
+        leaf_X = F.one_hot(leaf_X_indices.long(), num_classes=self.Xdim_output).float()  # [B, n_atoms, X_dim]
+        leaf_E_indices = tree.node_states_E[batch_range, leaf_indices]  # [B, n_atoms, n_atoms, E_dim]
+        leaf_E = F.one_hot(leaf_E_indices.long(), num_classes=self.Edim_output).float()  # [B, n_atoms, n_atoms, E_dim]
         leaf_y = tree.node_states_y[batch_range, leaf_indices]  # [B, y_dim]
         leaf_mask = tree.node_masks[batch_range, leaf_indices]  # [B, n_atoms]
         leaf_t_int = tree.node_timesteps_int[batch_range, leaf_indices]  # [B]
@@ -1311,10 +1320,14 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         
         # Reshape back to [batch_size, K, ...]
         sampled_E_reshaped = sampled_E.view(batch_size, K, *sampled_E.shape[1:])  # [B, K, n_atoms, n_atoms, E_dim]
+        original_X_reshaped = expanded_X.view(batch_size, K, *expanded_X.shape[1:])  # [B, K, n_atoms, X_dim]
         next_t_int_reshaped = next_t_int.view(batch_size, K)  # [B, K]
         # Note: next_t_norm and next_s_norm are [B*K, 1], when reshaped they become [B, K] not [B, K, 1]
         next_t_norm_reshaped = next_t_norm.squeeze(1).view(batch_size, K)  # [B, K]
         next_s_norm_reshaped = next_s_norm.squeeze(1).view(batch_size, K)  # [B, K]
+        # save memory for E and X
+        sampled_E_indices = sampled_E_reshaped.argmax(dim=-1).to(torch.uint8)
+        original_X_indices = original_X_reshaped.argmax(dim=-1).to(torch.uint8)
         
         # Store children states in tree
         for b in range(batch_size):
@@ -1323,8 +1336,8 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 for k in range(K):
                     child_idx = new_child_indices[b, k].item()
                     # Store state (X stays same, E updated)
-                    tree.node_states_X[b, child_idx] = leaf_X[b]
-                    tree.node_states_E[b, child_idx] = sampled_E_reshaped[b, k]
+                    tree.node_states_X[b, child_idx] = original_X_indices[b, k]
+                    tree.node_states_E[b, child_idx] = sampled_E_indices[b, k]
                     tree.node_states_y[b, child_idx] = leaf_y[b]
                     tree.node_masks[b, child_idx] = leaf_mask[b]
                     
@@ -1396,8 +1409,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         batch_indices = sample_indices
         
         # Gather node data: [N, ...]
-        X_t = tree.node_states_X[batch_indices, node_indices_flat]  # [N, n_atoms, X_dim]
-        E_t = tree.node_states_E[batch_indices, node_indices_flat]  # [N, n_atoms, n_atoms, E_dim]
+        X_t_indices = tree.node_states_X[batch_indices, node_indices_flat]
+        X_t = F.one_hot(X_t_indices.long(), num_classes=self.Xdim_output).float()  # [N, n_atoms, X_dim]
+        E_t_indices = tree.node_states_E[batch_indices, node_indices_flat]
+        E_t = F.one_hot(E_t_indices.long(), num_classes=self.Edim_output).float()  # [N, n_atoms, n_atoms, E_dim]
         y_t = tree.node_states_y[batch_indices, node_indices_flat]  # [N, y_dim]
         mask_t = tree.node_masks[batch_indices, node_indices_flat]  # [N, n_atoms]
         t_int = tree.node_timesteps_int[batch_indices, node_indices_flat]  # [N]
