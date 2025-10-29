@@ -73,7 +73,7 @@ def _bin_and_score_vectorized(pred_spec: np.ndarray, target_spec: np.ndarray,
 
     return cosine_score
 
-def _init_worker(gen_checkpoint, inten_checkpoint, device):
+def _init_worker(gen_checkpoint, inten_checkpoint, device, shared_cache):
     """Initialize worker with a complete JointModel."""
     global _worker_joint_model
     global _worker_cache
@@ -107,8 +107,8 @@ def _init_worker(gen_checkpoint, inten_checkpoint, device):
     _worker_joint_model.eval()
     _worker_joint_model.to(device)
 
-    # setup cache
-    _worker_cache = defaultdict()
+    # Use shared cache passed from main process
+    _worker_cache = shared_cache
 
 @torch.no_grad()
 def _worker_predict_and_score_spectrum(args):
@@ -221,11 +221,16 @@ class IcebergVerifier(BaseVerifier):
         # Decide the device for workers. For this CPU-heavy task, 'cpu' is best.
         worker_device = 'cpu'
         
+        # Create shared cache using Manager
+        self.manager = ctx.Manager()
+        self.shared_cache = self.manager.dict()
+        logging.info(f"Created shared cache for {num_workers} workers")
+        
         self.worker_pool = ctx.Pool(
             processes=num_workers,
             initializer=_init_worker,
-            # Pass checkpoints and the device for workers
-            initargs=(gen_checkpoint, inten_checkpoint, worker_device)
+            # Pass checkpoints, device, and shared cache to workers
+            initargs=(gen_checkpoint, inten_checkpoint, worker_device, self.shared_cache)
         )
         logging.info(f"Initialized persistent worker pool with {num_workers} workers on device '{worker_device}'")
 
@@ -240,10 +245,19 @@ class IcebergVerifier(BaseVerifier):
         # self.global_rank = 0
     
     def __del__(self):
-        """Cleanup worker pool on deletion."""
+        """Cleanup worker pool and manager on deletion."""
         if hasattr(self, 'worker_pool') and self.worker_pool is not None:
             self.worker_pool.close()
             self.worker_pool.join()
+        if hasattr(self, 'manager') and self.manager is not None:
+            self.manager.shutdown()
+    
+    def get_cache_stats(self):
+        """Get statistics about the shared cache."""
+        return {
+            'cache_size': len(self.shared_cache),
+            'cache_keys_sample': list(self.shared_cache.keys())[:5] if len(self.shared_cache) > 0 else []
+        }
 
     @torch.no_grad()
     def score_batch(self,
