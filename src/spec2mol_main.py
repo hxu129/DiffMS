@@ -254,7 +254,25 @@ def main(cfg: DictConfig):
                     'extra_features': extra_features, 'domain_features': domain_features}
 
     use_state_dict_only = False
-    if cfg.general.test_only:
+    validate_only = getattr(cfg.general, 'validate_only', None)
+    
+    if validate_only:
+        # When validating, load checkpoint similar to test_only
+        # Temporarily set test_only for get_resume to work
+        original_test_only = cfg.general.test_only
+        cfg.general.test_only = validate_only
+        cfg_resume, _ = get_resume(cfg, model_kwargs, model_class)
+        if cfg_resume is None:
+            # This is a state_dict-only checkpoint, we'll use load_weights instead
+            use_state_dict_only = True
+            logging.info(f"Using state_dict-only checkpoint for validation: {validate_only}")
+            # Restore original test_only
+            cfg.general.test_only = original_test_only
+        else:
+            cfg = cfg_resume
+            # Restore original test_only
+            cfg.general.test_only = original_test_only
+    elif cfg.general.test_only:
         # When testing, previous configuration is fully loaded
         cfg_resume, _ = get_resume(cfg, model_kwargs, model_class)
         if cfg_resume is None:
@@ -330,10 +348,24 @@ def main(cfg: DictConfig):
     
     # Load weights from state_dict-only checkpoint if needed
     if use_state_dict_only:
-        logging.info(f"Loading state_dict from {cfg.general.test_only}")
-        model = load_weights(model, cfg.general.test_only)
+        checkpoint_path = validate_only if validate_only else cfg.general.test_only
+        logging.info(f"Loading state_dict from {checkpoint_path}")
+        model = load_weights(model, checkpoint_path)
 
-    if not cfg.general.test_only:
+    # Check if validate_only mode is enabled
+    validate_only = getattr(cfg.general, 'validate_only', None)
+    
+    if validate_only:
+        # Validation-only mode for hyperparameter tuning
+        logging.info("=" * 80)
+        logging.info("VALIDATION-ONLY MODE: Running validation set evaluation")
+        logging.info("=" * 80)
+        if use_state_dict_only:
+            # Don't pass ckpt_path since we already loaded the weights
+            trainer.validate(model, datamodule=datamodule)
+        else:
+            trainer.validate(model, datamodule=datamodule, ckpt_path=validate_only)
+    elif not cfg.general.test_only:
         trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.general.resume)
         if cfg.general.name not in ['debug', 'test']:
             trainer.test(model, datamodule=datamodule, ckpt_path=cfg.general.checkpoint_strategy)

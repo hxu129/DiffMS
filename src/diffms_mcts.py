@@ -283,7 +283,6 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         self.val_iterations = None
         self.log_every_steps = cfg.general.log_every_steps
         self.best_val_nll = 1e8
-        self.val_counter = 1
         
         # Initialize MCTS configuration
         self._init_mcts_config()
@@ -315,6 +314,112 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             return
         self.verifier = build_verifier(self.cfg)
         self._verifier_ready = True
+
+    def on_validation_epoch_start(self) -> None:
+        if self.global_rank == 0:
+            logging.info("Starting validation...")
+        self.val_nll.reset()
+        self.val_X_kl.reset()
+        self.val_E_kl.reset()
+        self.val_X_logp.reset()
+        self.val_E_logp.reset()
+        self.val_k_acc.reset()
+        self.val_sim_metrics.reset()
+        self.val_validity.reset()
+        self.val_CE.reset()
+
+    def validation_step(self, batch, i):
+        output, aux = self.encoder(batch)
+
+        data = batch["graph"]
+        if self.merge == 'mist_fp':
+            data.y = aux["int_preds"][-1]
+        if self.merge == 'merge-encoder_output-linear':
+            encoder_output = aux['h0']
+            data.y = self.merge_function(encoder_output)
+        elif self.merge == 'merge-encoder_output-mlp':
+            encoder_output = aux['h0']
+            data.y = self.merge_function(encoder_output)
+        elif self.merge == 'downproject_4096':
+            data.y = self.merge_function(output)
+
+        dense_data, node_mask = utils.to_dense(data.x, data.edge_index, data.edge_attr, data.batch)
+        dense_data = dense_data.mask(node_mask)
+        noisy_data = self.apply_noise(dense_data.X, dense_data.E, data.y, node_mask)
+        extra_data = self.compute_extra_data(noisy_data)
+
+        pred = self.forward(noisy_data, extra_data, node_mask)
+        pred.X = dense_data.X
+        pred.Y = data.y
+
+        nll = 0.0 
+
+        true_E = torch.reshape(dense_data.E, (-1, dense_data.E.size(-1)))  # (bs * n * n, de)
+        masked_pred_E = torch.reshape(pred.E, (-1, pred.E.size(-1)))   # (bs * n * n, de)
+        mask_E = (true_E != 0.).any(dim=-1)
+
+        flat_true_E = true_E[mask_E, :]
+        flat_pred_E = masked_pred_E[mask_E, :]
+
+        self.val_CE(flat_pred_E, flat_true_E)
+
+        true_mols = [Chem.inchi.MolFromInchi(data.get_example(idx).inchi) for idx in range(len(data))] # Is this correct?
+        predicted_mols = [list() for _ in range(len(data))]
+
+        if self.global_rank == 0:
+            logging.info(f"Batch {i}: Generating {self.test_num_samples} molecules for {len(data)} samples...")
+
+        env_metas, spectra_arrays = extract_from_dataset_batch(batch, self.trainer.datamodule.test_dataset)
+        mcts_results = self.mcts_sample_batch(data, env_metas, spectra_arrays)
+        for idx, sample_results in enumerate(mcts_results):
+            # Extract molecules from top-k results
+            for smi, score, mol in sample_results:
+                predicted_mols[idx].append(mol) # [bs, num_predictions]
+                
+        with open(f"preds/{self.name}_rank_{self.global_rank}_pred_{i}.pkl", "wb") as f:
+            pickle.dump(predicted_mols, f)
+        with open(f"preds/{self.name}_rank_{self.global_rank}_true_{i}.pkl", "wb") as f:
+            pickle.dump(true_mols, f)
+        
+        for idx in range(len(data)):
+            self.val_k_acc.update(predicted_mols[idx], true_mols[idx])
+            self.val_sim_metrics.update(predicted_mols[idx], true_mols[idx])
+            self.val_validity.update(predicted_mols[idx])
+
+        return {'loss': nll}
+
+    def on_validation_epoch_end(self) -> None:
+        """ Measure likelihood on a test set and compute stability metrics. """
+        metrics = [
+            self.val_nll.compute(), 
+            self.val_X_kl.compute(), 
+            self.val_E_kl.compute(),
+            self.val_X_logp.compute(), 
+            self.val_E_logp.compute(),
+            self.val_CE.compute()
+        ]
+
+        log_dict = {
+            "val/NLL": metrics[0],
+            "val/X_KL": metrics[1],
+            "val/E_KL": metrics[2],
+            "val/X_logp": metrics[3],
+            "val/E_logp": metrics[4],
+            "val/E_CE": metrics[5]
+        }
+
+        self.log_dict(log_dict, sync_dist=True)
+        if self.global_rank == 0:
+            logging.info(f"Epoch {self.current_epoch}: Test NLL {metrics[0] :.2f} -- Test Atom type KL {metrics[1] :.2f} -- Test Edge type KL: {metrics[2] :.2f} -- Test Edge type logp: {metrics[3] :.2f} -- Test Edge type CE: {metrics[5] :.2f}")
+
+        log_dict = {}
+        for key, value in self.val_k_acc.compute().items():
+            log_dict[f"val/{key}"] = value
+        for key, value in self.val_sim_metrics.compute().items():
+            log_dict[f"val/{key}"] = value
+        log_dict["val/validity"] = self.val_validity.compute()
+
+        self.log_dict(log_dict, sync_dist=True)
 
     def on_test_epoch_start(self) -> None:
         if self.global_rank == 0:
