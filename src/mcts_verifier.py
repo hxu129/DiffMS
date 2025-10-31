@@ -23,6 +23,7 @@ from functools import partial
 import time
 import warnings
 import logging
+from hashlib import sha256
 
 # Disable RDKit warnings globally
 os.environ['RDKIT_CATCH_WARNINGS'] = '0'
@@ -73,10 +74,11 @@ def _bin_and_score_vectorized(pred_spec: np.ndarray, target_spec: np.ndarray,
 
     return cosine_score
 
-def _init_worker(gen_checkpoint, inten_checkpoint, device, shared_cache):
+def _init_worker(gen_checkpoint, inten_checkpoint, device, shared_cache_spec, shared_cache_score):
     """Initialize worker with a complete JointModel."""
     global _worker_joint_model
-    global _worker_cache
+    global _worker_cache_spec
+    global _worker_cache_score
 
     # Suppress warnings in worker processes
     import warnings
@@ -108,7 +110,8 @@ def _init_worker(gen_checkpoint, inten_checkpoint, device, shared_cache):
     _worker_joint_model.to(device)
 
     # Use shared cache passed from main process
-    _worker_cache = shared_cache
+    _worker_cache_spec = shared_cache_spec
+    _worker_cache_score = shared_cache_score
 
 @torch.no_grad()
 def _worker_predict_and_score_spectrum(args):
@@ -131,15 +134,21 @@ def _worker_predict_and_score_spectrum(args):
     warnings.filterwarnings('ignore', category=DeprecationWarning)
 
     global _worker_joint_model
-    global _worker_cache
+    global _worker_cache_spec
+    global _worker_cache_score
     mol, t_spec, adduct, device, bin_size = args
 
     # stage 1: predict the spectrum
     try:
         # predict_mol is a method of the JointModel class
         smi = Chem.MolToSmiles(mol, canonical=True)
-        if smi+adduct in _worker_cache:
-            p_spec = _worker_cache[smi+adduct]
+        hash_key = smi + adduct + sha256(t_spec.tobytes()).hexdigest()
+        if hash_key in _worker_cache_score:
+            score = _worker_cache_score[hash_key]
+            return score
+        
+        if smi+adduct in _worker_cache_spec:
+            p_spec = _worker_cache_spec[smi+adduct]
         else:
             output = _worker_joint_model.predict_mol(
                 mol=mol,
@@ -169,19 +178,20 @@ def _worker_predict_and_score_spectrum(args):
         else:
             p_spec = np.array(list(mass_to_inten.items()), dtype=float)
 
-        _worker_cache[smi+adduct] = p_spec
-
     except Exception as e:
         logging.error(f"Worker error on SMILES {smi}: {e}")
         p_spec = np.array([[0.0, 0.0]])
+
+    _worker_cache_spec[smi+adduct] = p_spec
 
     # stage 2: score the spectrum
     try:
         score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, bin_size=bin_size)
     except Exception as e:
         logging.error(f"Worker error on scoring spectrum {smi}: {e}")
-        return 0.0
+        score = 0.0
     
+    _worker_cache_score[hash_key] = score
     return score
 
 class BaseVerifier:
@@ -223,14 +233,15 @@ class IcebergVerifier(BaseVerifier):
         
         # Create shared cache using Manager
         self.manager = ctx.Manager()
-        self.shared_cache = self.manager.dict()
+        self.shared_cache_spec = self.manager.dict()
+        self.shared_cache_score = self.manager.dict()
         logging.info(f"Created shared cache for {num_workers} workers")
         
         self.worker_pool = ctx.Pool(
             processes=num_workers,
             initializer=_init_worker,
             # Pass checkpoints, device, and shared cache to workers
-            initargs=(gen_checkpoint, inten_checkpoint, worker_device, self.shared_cache)
+            initargs=(gen_checkpoint, inten_checkpoint, worker_device, self.shared_cache_spec, self.shared_cache_score)
         )
         logging.info(f"Initialized persistent worker pool with {num_workers} workers on device '{worker_device}'")
 
@@ -255,8 +266,8 @@ class IcebergVerifier(BaseVerifier):
     def get_cache_stats(self):
         """Get statistics about the shared cache."""
         return {
-            'cache_size': len(self.shared_cache),
-            'cache_keys_sample': list(self.shared_cache.keys())[:5] if len(self.shared_cache) > 0 else []
+            'cache_size': len(self.shared_cache_spec),
+            'cache_keys_sample': list(self.shared_cache_spec.keys())[:5] if len(self.shared_cache_spec) > 0 else []
         }
 
     @torch.no_grad()
