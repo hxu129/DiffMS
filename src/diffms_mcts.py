@@ -300,7 +300,8 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             'c_puct': _get('c_puct', _get('c_uct', 1.0)),
             'time_budget_s': _get('time_budget_s', 0.0),
             'verifier_batch_size': _get('verifier_batch_size', 32),
-            't_thresh': _get('t_thresh', 10),
+            'expand_steps': _get('expand_steps', 1),  # Number of denoising steps during expansion
+            'prediffuse_steps': _get('prediffuse_steps', 10),
         }
         # External verifier should be injected; we only call verifier.score()
         self.verifier = getattr(self, 'verifier', None)
@@ -517,7 +518,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         tree = self._initialize_batched_tree(data, max_nodes)
         
         # Pre-diffuse root states from T to t_thresh
-        tree = self._batched_prediffuse(tree, self.mcts_config['t_thresh'])
+        tree = self._batched_prediffuse(tree, self.mcts_config['prediffuse_steps'])
         
         # Main MCTS loop: run num_simulation_steps iterations
         num_simulations = self.mcts_config['num_simulation_steps']
@@ -1038,7 +1039,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         )
     
     @torch.no_grad()
-    def _batched_prediffuse(self, tree: BatchedMctsTree, t_thresh: int) -> BatchedMctsTree:
+    def _batched_prediffuse(self, tree: BatchedMctsTree, prediffuse_steps: int) -> BatchedMctsTree:
         """
         Pre-diffuse root states from T down to t_thresh using batched denoising.
         
@@ -1068,6 +1069,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         
         # Diffuse from T down to t_thresh
         # Original code: for s_int in reversed(range(t_thresh, self.T))
+        t_thresh = max(0, self.T - prediffuse_steps)
         for s_int in reversed(range(t_thresh, self.T)):
             # s_array: [batch_size, 1]
             s_array = torch.full((batch_size, 1), s_int, dtype=torch.float32, device=device)
@@ -1237,7 +1239,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         Algorithm:
         - Gather states from selected leaf nodes [batch_size, ...]
         - Repeat each state K times -> [batch_size*K, ...]
-        - Call sample_p_zs_given_zt once with batch_size*K samples (batched denoising)
+        - Perform multi-step denoising (expand_steps) with dynamic masking:
+          * For each step, denoise only active samples (timestep > 0)
+          * Samples that reach terminal state (t=0) stop denoising
+          * Continue until all samples reach terminal or expand_steps exhausted
         - Allocate K new node indices per sample
         - Store children states in tree
         - Update parent-child relationships
@@ -1295,36 +1300,66 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         expanded_mask = leaf_mask.repeat_interleave(K, dim=0)  # [B*K, n_atoms]
         expanded_t_int = leaf_t_int.repeat_interleave(K)  # [B*K]
         
-        # Compute next timestep: t' = t - 1
-        # Shape: [B*K]
-        next_t_int = expanded_t_int - 1
-        next_t_int = torch.clamp(next_t_int, min=0)  # Ensure non-negative
+        # Multi-step denoising with dynamic masking
+        # Get number of expansion steps from config
+        expand_steps = self.mcts_config.get('expand_steps', 1)
         
-        # Prepare s_norm and t_norm for denoising
-        # For child at timestep t', denoising uses s'=(t'-1)/T, t'=(t')/T
-        # Shape: [B*K, 1]
-        next_leaf_t_norm = (expanded_t_int.float() / self.T).unsqueeze(1)  # [B*K, 1]
-        next_t_norm = (next_t_int.float() / self.T).unsqueeze(1)  # [B*K, 1]
-        next_s_norm = ((next_t_int.float() - 1).clamp(min=0) / self.T).unsqueeze(1)  # [B*K, 1]
+        # Track current timesteps for each sample
+        current_t_int = expanded_t_int # [B*K]
+        current_X = expanded_X # [B*K, n_atoms, X_dim]
+        current_E = expanded_E  # [B*K, n_atoms, n_atoms, E_dim]
         
-        # Batched denoising: sample K children per sample in one forward pass
-        # sample_p_zs_given_zt handles batch dimension automatically
-        # Input: [B*K, ...], Output: [B*K, ...]
-        sampled_states, _ = self.sample_p_zs_given_zt(
-            next_t_norm, next_leaf_t_norm, expanded_X, expanded_E, expanded_y, expanded_mask
-        )
+        # Perform expand_steps denoising steps with dynamic masking
+        for step in range(expand_steps):
+            # Create active mask: which samples still need denoising (current_t_int > 0)
+            active_mask = current_t_int > 0  # [B*K]
+            
+            if not active_mask.any():
+                # All samples have reached terminal state
+                break
+            
+            # Compute next timestep: t' = t - 1
+            next_t_int = (current_t_int - 1).clamp(min=0)
+            
+            # Prepare s_norm and t_norm for denoising
+            # For child at timestep t', denoising uses s'=(t'-1)/T, t'=(t')/T
+            # Shape: [B*K, 1]
+            next_leaf_t_norm = (current_t_int.float() / self.T).unsqueeze(1)  # [B*K, 1]
+            next_t_norm = (next_t_int.float() / self.T).unsqueeze(1)  # [B*K, 1]
+            
+            # Batched denoising: sample K children per sample in one forward pass
+            # sample_p_zs_given_zt handles batch dimension automatically
+            # Input: [B*K, ...], Output: [B*K, ...]
+            sampled_states, _ = self.sample_p_zs_given_zt(
+                next_t_norm, next_leaf_t_norm, current_X, current_E, expanded_y, expanded_mask
+            )
+            
+            # Update ONLY active samples using the mask
+            # For inactive samples (already at t=0), keep their current state
+            active_mask_E = active_mask.view(-1, 1, 1, 1)  # [B*K, 1, 1, 1]
+            current_E = torch.where(active_mask_E, sampled_states.E, current_E)
+            
+            # Note: X stays unchanged (edge-only denoising)
+            # current_X remains the same
+            
+            # Update timesteps for active samples
+            current_t_int = torch.where(active_mask, next_t_int, current_t_int)
         
-        # Extract sampled edges (edge-only denoising: keep X unchanged)
-        # Shape: [B*K, n_atoms, n_atoms, E_dim]
-        sampled_E = sampled_states.E
+        # After multi-step denoising, use the final states
+        next_t_int = current_t_int  # [B*K]
+        sampled_E = current_E  # [B*K, n_atoms, n_atoms, E_dim]
+        
+        # Compute final normalized timesteps
+        next_t_norm_final = (next_t_int.float() / self.T)  # [B*K]
+        next_s_norm_final = ((next_t_int.float() - 1).clamp(min=0) / self.T)  # [B*K]
         
         # Reshape back to [batch_size, K, ...]
         sampled_E_reshaped = sampled_E.view(batch_size, K, *sampled_E.shape[1:])  # [B, K, n_atoms, n_atoms, E_dim]
         original_X_reshaped = expanded_X.view(batch_size, K, *expanded_X.shape[1:])  # [B, K, n_atoms, X_dim]
         next_t_int_reshaped = next_t_int.view(batch_size, K)  # [B, K]
-        # Note: next_t_norm and next_s_norm are [B*K, 1], when reshaped they become [B, K] not [B, K, 1]
-        next_t_norm_reshaped = next_t_norm.squeeze(1).view(batch_size, K)  # [B, K]
-        next_s_norm_reshaped = next_s_norm.squeeze(1).view(batch_size, K)  # [B, K]
+        # Note: next_t_norm_final and next_s_norm_final are [B*K], when reshaped they become [B, K]
+        next_t_norm_reshaped = next_t_norm_final.view(batch_size, K)  # [B, K]
+        next_s_norm_reshaped = next_s_norm_final.view(batch_size, K)  # [B, K]
         # save memory for E and X
         sampled_E_indices = sampled_E_reshaped.argmax(dim=-1).to(torch.uint8)
         original_X_indices = original_X_reshaped.argmax(dim=-1).to(torch.uint8)

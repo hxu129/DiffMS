@@ -1,8 +1,8 @@
-HYDRA_FULL_ERROR=1 CUDA_VISIBLE_DEVICES=2 python src/spec2mol_main.py \
-    train.eval_batch_size=40 \
-    dataset.max_count=null \
+HYDRA_FULL_ERROR=1 CUDA_VISIBLE_DEVICES=0 python src/spec2mol_main.py \
+    train.eval_batch_size=136 \
+    dataset.max_count=2000 \
     general.test_only=/local3/ericjiang/wgc/huaxu/ms/DiffMS/checkpoints/diffms_canopus.ckpt \
-    general.name=mcts-3000-2-exp-parallel \
+    general.name=test-expand-multiple-steps \
     general.wandb_name=test \
     general.test_samples_to_generate=100 \
     general.gpus=1 \
@@ -10,10 +10,11 @@ HYDRA_FULL_ERROR=1 CUDA_VISIBLE_DEVICES=2 python src/spec2mol_main.py \
     mcts.use_mcts=true \
     mcts.num_simulation_steps=3000 \
     mcts.branch_k=2 \
-    mcts.c_puct=0.05 \
+    mcts.c_puct=0.5 \
     mcts.time_budget_s=0.0 \
     mcts.verifier_batch_size=32 \
     mcts.verifier_type=iceberg \
-    mcts.num_workers=40 \
-    mcts.t_thresh=200 \
+    mcts.num_workers=64 \
+    mcts.prediffuse_steps=0 \
+    mcts.expand_steps=5 \
     mcts.similarity.bin_size=10.0
