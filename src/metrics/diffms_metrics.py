@@ -39,12 +39,36 @@ class K_ACC_Collection(Metric):
         for k in k_list:
             self.metrics[f"acc_at_{k}"] = K_ACC(k, dist_sync_on_step=dist_sync_on_step)
 
-    def update(self, generated_mols: List[Chem.Mol], true_mol: Chem.Mol):
-        # Filter out invalid molecules, and select unique InChIs by frequency
-        inchis = [Chem.MolToInchi(mol) for mol in generated_mols if is_valid(mol)]
-        inchi_counter = Counter(inchis)
-        # Sort by frequency, keep unique
-        inchis = [item for item, _count in inchi_counter.most_common()]
+    def update(self, generated_mols: List[Chem.Mol], true_mol: Chem.Mol, scores: List[float] = None):
+        # Filter out invalid molecules
+        valid_mols = [(mol, i) for i, mol in enumerate(generated_mols) if is_valid(mol)]
+        
+        if scores is not None:
+            # MCTS mode: rank by similarity scores (descending)
+            # Get valid scores corresponding to valid molecules
+            valid_scores = [scores[i] for _, i in valid_mols]
+            valid_mol_list = [mol for mol, _ in valid_mols]
+            
+            # Convert to InChIs and pair with scores
+            inchi_score_pairs = [(Chem.MolToInchi(mol), score) 
+                                  for mol, score in zip(valid_mol_list, valid_scores)]
+            
+            # Deduplicate: keep highest score for each unique InChI
+            inchi_best_scores = {}
+            for inchi, score in inchi_score_pairs:
+                if inchi not in inchi_best_scores or score > inchi_best_scores[inchi]:
+                    inchi_best_scores[inchi] = score
+            
+            # Sort by score (descending), extract InChIs
+            inchis = [inchi for inchi, _ in sorted(inchi_best_scores.items(), 
+                                                     key=lambda x: x[1], reverse=True)]
+        else:
+            # Non-MCTS mode: rank by frequency (original behavior)
+            inchis = [Chem.MolToInchi(mol) for mol, _ in valid_mols]
+            inchi_counter = Counter(inchis)
+            # Sort by frequency, keep unique
+            inchis = [item for item, _count in inchi_counter.most_common()]
+        
         true_inchi = Chem.MolToInchi(true_mol)
 
         # Update each K_ACC submetric
@@ -115,10 +139,34 @@ class K_SimilarityCollection(Metric):
             self.metrics[f"tanimoto_at_{k}"] = K_TanimotoSimilarity(k, dist_sync_on_step=dist_sync_on_step)
             self.metrics[f"cosine_at_{k}"] = K_CosineSimilarity(k, dist_sync_on_step=dist_sync_on_step)
 
-    def update(self, generated_mols: List[Chem.Mol], true_mol: Chem.Mol):
-        inchis = [Chem.MolToInchi(mol) for mol in generated_mols if is_valid(mol)]
-        inchi_counter = Counter(inchis)
-        inchis = [item for item, _count in inchi_counter.most_common()]
+    def update(self, generated_mols: List[Chem.Mol], true_mol: Chem.Mol, scores: List[float] = None):
+        # Filter out invalid molecules
+        valid_mols = [(mol, i) for i, mol in enumerate(generated_mols) if is_valid(mol)]
+        
+        if scores is not None:
+            # MCTS mode: rank by similarity scores (descending)
+            # Get valid scores corresponding to valid molecules
+            valid_scores = [scores[i] for _, i in valid_mols]
+            valid_mol_list = [mol for mol, _ in valid_mols]
+            
+            # Convert to InChIs and pair with scores
+            inchi_score_pairs = [(Chem.MolToInchi(mol), score, mol) 
+                                  for mol, score in zip(valid_mol_list, valid_scores)]
+            
+            # Deduplicate: keep highest score for each unique InChI
+            inchi_best_scores = {}
+            for inchi, score, mol in inchi_score_pairs:
+                if inchi not in inchi_best_scores or score > inchi_best_scores[inchi][0]:
+                    inchi_best_scores[inchi] = (score, mol)
+            
+            # Sort by score (descending), extract InChIs
+            sorted_items = sorted(inchi_best_scores.items(), key=lambda x: x[1][0], reverse=True)
+            inchis = [inchi for inchi, _ in sorted_items]
+        else:
+            # Non-MCTS mode: rank by frequency (original behavior)
+            inchis = [Chem.MolToInchi(mol) for mol, _ in valid_mols]
+            inchi_counter = Counter(inchis)
+            inchis = [item for item, _count in inchi_counter.most_common()]
 
         processed_mols = [canonical_mol_from_inchi(inchi) for inchi in inchis]
 

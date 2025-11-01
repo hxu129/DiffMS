@@ -365,6 +365,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         true_mols = [Chem.inchi.MolFromInchi(data.get_example(idx).inchi) for idx in range(len(data))] # Is this correct?
         predicted_mols = [list() for _ in range(len(data))]
+        predicted_scores = [list() for _ in range(len(data))]
 
         if self.global_rank == 0:
             logging.info(f"Batch {i}: Generating {self.test_num_samples} molecules for {len(data)} samples...")
@@ -372,9 +373,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         env_metas, spectra_arrays = extract_from_dataset_batch(batch, self.trainer.datamodule.test_dataset)
         mcts_results = self.mcts_sample_batch(data, env_metas, spectra_arrays)
         for idx, sample_results in enumerate(mcts_results):
-            # Extract molecules from top-k results
+            # Extract molecules and scores from top-k results
             for smi, score, mol in sample_results:
                 predicted_mols[idx].append(mol) # [bs, num_predictions]
+                predicted_scores[idx].append(score) # [bs, num_predictions]
                 
         with open(f"preds/{self.name}_rank_{self.global_rank}_pred_{i}.pkl", "wb") as f:
             pickle.dump(predicted_mols, f)
@@ -382,8 +384,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             pickle.dump(true_mols, f)
         
         for idx in range(len(data)):
-            self.val_k_acc.update(predicted_mols[idx], true_mols[idx])
-            self.val_sim_metrics.update(predicted_mols[idx], true_mols[idx])
+            # Pass scores to metrics for MCTS-based ranking
+            self.val_k_acc.update(predicted_mols[idx], true_mols[idx], scores=predicted_scores[idx])
+            self.val_sim_metrics.update(predicted_mols[idx], true_mols[idx], scores=predicted_scores[idx])
             self.val_validity.update(predicted_mols[idx])
 
         return {'loss': nll}
@@ -471,6 +474,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         true_mols = [Chem.inchi.MolFromInchi(data.get_example(idx).inchi) for idx in range(len(data))] # Is this correct?
         predicted_mols = [list() for _ in range(len(data))]
+        predicted_scores = [list() for _ in range(len(data))]
 
         if self.global_rank == 0:
             logging.info(f"Batch {i}: Generating {self.test_num_samples} molecules for {len(data)} samples...")
@@ -478,9 +482,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         env_metas, spectra_arrays = extract_from_dataset_batch(batch, self.trainer.datamodule.test_dataset)
         mcts_results = self.mcts_sample_batch(data, env_metas, spectra_arrays)
         for idx, sample_results in enumerate(mcts_results):
-            # Extract molecules from top-k results
+            # Extract molecules and scores from top-k results
             for smi, score, mol in sample_results:
                 predicted_mols[idx].append(mol) # [bs, num_predictions]
+                predicted_scores[idx].append(score) # [bs, num_predictions]
                 
         with open(f"preds/{self.name}_rank_{self.global_rank}_pred_{i}.pkl", "wb") as f:
             pickle.dump(predicted_mols, f)
@@ -488,8 +493,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             pickle.dump(true_mols, f)
         
         for idx in range(len(data)):
-            self.test_k_acc.update(predicted_mols[idx], true_mols[idx])
-            self.test_sim_metrics.update(predicted_mols[idx], true_mols[idx])
+            # Pass scores to metrics for MCTS-based ranking
+            self.test_k_acc.update(predicted_mols[idx], true_mols[idx], scores=predicted_scores[idx])
+            self.test_sim_metrics.update(predicted_mols[idx], true_mols[idx], scores=predicted_scores[idx])
             self.test_validity.update(predicted_mols[idx])
 
         return {'loss': nll}

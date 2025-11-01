@@ -306,17 +306,17 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         self.val_CE(flat_pred_E, flat_true_E)
 
-        if self.val_counter % self.cfg.general.sample_every_val == 0:
-            true_mols = [Chem.inchi.MolFromInchi(data.get_example(idx).inchi) for idx in range(len(data))] # Is this correct?
-            predicted_mols = [list() for _ in range(len(data))]
-            for _ in range(self.val_num_samples):
-                for idx, mol in enumerate(self.sample_batch(data)):
-                    predicted_mols[idx].append(mol)
-        
-            for idx in range(len(data)):
-                self.val_k_acc.update(predicted_mols[idx], true_mols[idx])
-                self.val_sim_metrics.update(predicted_mols[idx], true_mols[idx])
-                self.val_validity.update(predicted_mols[idx])
+        # Always generate and evaluate molecules (removed conditional check)
+        true_mols = [Chem.inchi.MolFromInchi(data.get_example(idx).inchi) for idx in range(len(data))] # Is this correct?
+        predicted_mols = [list() for _ in range(len(data))]
+        for _ in range(self.val_num_samples):
+            for idx, mol in enumerate(self.sample_batch(data)):
+                predicted_mols[idx].append(mol)
+    
+        for idx in range(len(data)):
+            self.val_k_acc.update(predicted_mols[idx], true_mols[idx])
+            self.val_sim_metrics.update(predicted_mols[idx], true_mols[idx])
+            self.val_validity.update(predicted_mols[idx])
 
         return {'loss': nll}
 
@@ -339,12 +339,12 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             "val/E_CE": metrics[5]
         }
 
-        if self.val_counter % self.cfg.general.sample_every_val == 0:
-            for key, value in self.val_k_acc.compute().items():
-                log_dict[f"val/{key}"] = value
-            for key, value in self.val_sim_metrics.compute().items():
-                log_dict[f"val/{key}"] = value
-            log_dict["val/validity"] = self.val_validity.compute()
+        # Always log molecule metrics (removed conditional check)
+        for key, value in self.val_k_acc.compute().items():
+            log_dict[f"val/{key}"] = value
+        for key, value in self.val_sim_metrics.compute().items():
+            log_dict[f"val/{key}"] = value
+        log_dict["val/validity"] = self.val_validity.compute()
 
         self.log_dict(log_dict, sync_dist=True)
 
