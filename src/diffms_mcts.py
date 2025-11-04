@@ -301,6 +301,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             'verifier_batch_size': _get('verifier_batch_size', 32),
             'expand_steps': _get('expand_steps', 1),  # Number of denoising steps during expansion
             'prediffuse_steps': _get('prediffuse_steps', 10),
+            'debug_logging': _get('debug_logging', False),  # Enable detailed debug logging
         }
         # External verifier should be injected; we only call verifier.score()
         self.verifier = getattr(self, 'verifier', None)
@@ -308,7 +309,24 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         self._mcts_logits_cache = {}
         self._smiles_score_cache = {}
         self._verifier_ready = False
+        
+        # Debug tracking (only initialized if debug_logging is enabled)
+        if self.mcts_config['debug_logging']:
+            self._init_debug_tracking()
 
+    def _init_debug_tracking(self):
+        """Initialize data structures for detailed MCTS debugging."""
+        self.debug_metrics = {
+            'tree_size_history': [],           # Track total nodes over simulation steps
+            'root_children_visits': [],         # Track root's children visit counts over time
+            'reward_history': [],               # All rewards seen during search
+            'q_value_history': [],              # Top nodes' Q-values over time
+            'simulation_step_markers': [],      # Which simulation step each metric was recorded
+        }
+        # Track search paths: node_id -> (parent_id, smiles, score, discovery_step)
+        self.node_provenance = {}
+        logging.info("[DEBUG] MCTS debug tracking initialized")
+    
     def _ensure_verifier(self):
         if self._verifier_ready and self.verifier is not None:
             return
@@ -655,11 +673,21 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             # Input: [batch_size, K] node indices and scores
             tree = self._batched_backup(tree, new_child_indices, child_scores)
             
+            # Debug logging: track metrics at regular intervals
+            if self.mcts_config['debug_logging'] and (sim_step + 1) % 50 == 0:
+                self._log_mcts_metrics(tree, sim_step + 1, batch_size, new_child_indices)
+            
             if self.global_rank == 0 and (sim_step + 1) % 50 == 0:
                 logging.info(f"Completed {sim_step + 1}/{num_simulations} MCTS simulations")
         
         # Extract results from each tree
         results = self._extract_batched_results(tree, env_metas, spectra)
+        
+        # Final debug summary and save metrics
+        if self.mcts_config['debug_logging'] and self.global_rank == 0:
+            self._log_final_debug_summary(tree, results, batch_size)
+            self._save_debug_metrics()
+            self._save_tree_structure(tree, sample_idx=0)  # Save tree for sample 0
         
         return results
     
@@ -1040,6 +1068,306 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         return utils.PlaceHolder(X=extra_X, E=extra_E, y=extra_y)
 
+    # ==================== Debug Logging Methods ====================
+    
+    def _log_mcts_metrics(self, tree: BatchedMctsTree, sim_step: int, batch_size: int, 
+                         newly_evaluated_nodes: torch.Tensor = None):
+        """
+        Log key MCTS metrics for debugging.
+        
+        Tracks:
+        - Tree size (total nodes)
+        - Root children visit counts (exploration balance)
+        - Reward distribution (sparsity analysis) - ONLY for newly evaluated nodes in this step
+        - Q-values of top nodes
+        """
+        device = tree.node_visits.device
+        
+        # Focus on first sample for detailed logging (to avoid clutter)
+        sample_idx = 0
+        
+        # 1. Tree size
+        tree_size = tree.num_nodes[sample_idx].item()
+        self.debug_metrics['tree_size_history'].append(tree_size)
+        self.debug_metrics['simulation_step_markers'].append(sim_step)
+        
+        # 2. Root children visit counts
+        root_children_indices = tree.children_index[sample_idx, BatchedMctsTree.ROOT_INDEX]  # [branch_k]
+        root_children_visits = []
+        for child_idx in root_children_indices:
+            if child_idx != BatchedMctsTree.UNVISITED:
+                visits = tree.node_visits[sample_idx, child_idx].item()
+                root_children_visits.append(visits)
+        self.debug_metrics['root_children_visits'].append(root_children_visits.copy())
+        
+        # 3. Reward distribution - collect rewards ONLY from newly evaluated nodes in this step
+        if newly_evaluated_nodes is not None:
+            # newly_evaluated_nodes shape: [batch_size, K] - only look at sample 0
+            new_node_indices = newly_evaluated_nodes[sample_idx].cpu().numpy()  # [K]
+            # Get unique node indices (terminal nodes might be repeated)
+            unique_new_nodes = np.unique(new_node_indices)
+            if len(unique_new_nodes) > 0:
+                # Convert to torch tensor for indexing
+                unique_new_nodes_tensor = torch.from_numpy(unique_new_nodes).to(device)
+                # Get rewards for these nodes
+                current_step_rewards = tree.node_rewards[sample_idx, unique_new_nodes_tensor]
+                # Filter out nodes with visit count = 0 (shouldn't happen, but safety check)
+                valid_mask = tree.node_visits[sample_idx, unique_new_nodes_tensor] > 0
+                if valid_mask.any():
+                    valid_rewards = current_step_rewards[valid_mask]
+                    if valid_rewards.numel() > 0:
+                        self.debug_metrics['reward_history'].extend(valid_rewards.cpu().tolist())
+                        valid_rewards_for_stats = valid_rewards
+                    else:
+                        valid_rewards_for_stats = torch.tensor([], device=device)
+                else:
+                    valid_rewards_for_stats = torch.tensor([], device=device)
+            else:
+                valid_rewards_for_stats = torch.tensor([], device=device)
+        else:
+            # Fallback: collect all non-zero rewards (old behavior)
+            valid_mask = (tree.node_visits[sample_idx] > 0)
+            valid_rewards = tree.node_rewards[sample_idx][valid_mask]
+            if valid_rewards.numel() > 0:
+                self.debug_metrics['reward_history'].extend(valid_rewards.cpu().tolist())
+            valid_rewards_for_stats = valid_rewards if valid_rewards.numel() > 0 else torch.tensor([], device=device)
+        
+        # 4. Q-values of top nodes (sorted by visit count)
+        visits = tree.node_visits[sample_idx]
+        values = tree.node_values[sample_idx]
+        Q_values = torch.where(visits > 0, values / visits.float(), torch.zeros_like(values))
+        
+        # Get top-10 most visited nodes
+        valid_mask_all = (tree.node_visits[sample_idx] > 0)
+        top_k = min(10, valid_mask_all.sum().item())
+        if top_k > 0:
+            top_visits, top_indices = torch.topk(visits, k=top_k)
+            top_Q = Q_values[top_indices]
+            self.debug_metrics['q_value_history'].append({
+                'step': sim_step,
+                'top_visits': top_visits.cpu().tolist(),
+                'top_Q': top_Q.cpu().tolist()
+            })
+        
+        # Log summary
+        if self.global_rank == 0:
+            logging.info(f"\n{'='*80}")
+            logging.info(f"[DEBUG METRICS] Simulation Step {sim_step}")
+            logging.info(f"{'='*80}")
+            logging.info(f"  Tree Size: {tree_size} nodes")
+            logging.info(f"  Root Children Visits: {root_children_visits}")
+            
+            if len(root_children_visits) > 0:
+                max_visits = max(root_children_visits)
+                min_visits = min(root_children_visits)
+                balance_ratio = min_visits / max_visits if max_visits > 0 else 0.0
+                logging.info(f"  Visit Balance Ratio (min/max): {balance_ratio:.3f}")
+                if balance_ratio < 0.1:
+                    logging.info(f"  ⚠️  WARNING: Highly imbalanced exploration! Consider increasing c_puct.")
+            
+            # Log reward stats for newly evaluated nodes only
+            if valid_rewards_for_stats.numel() > 0:
+                num_new_nodes = valid_rewards_for_stats.numel()
+                logging.info(f"  Reward Stats (Current Step - {num_new_nodes} newly evaluated nodes):")
+                logging.info(f"    - Mean: {valid_rewards_for_stats.mean().item():.4f}")
+                logging.info(f"    - Std:  {valid_rewards_for_stats.std().item():.4f}")
+                logging.info(f"    - Min:  {valid_rewards_for_stats.min().item():.4f}")
+                logging.info(f"    - Max:  {valid_rewards_for_stats.max().item():.4f}")
+                
+                # Check for sparse rewards
+                near_zero = (valid_rewards_for_stats.abs() < 0.01).sum().item()
+                total_rewards = valid_rewards_for_stats.numel()
+                sparsity_ratio = near_zero / total_rewards
+                logging.info(f"    - Sparsity (near-zero): {sparsity_ratio:.2%}")
+                if sparsity_ratio > 0.9:
+                    logging.info(f"  ⚠️  WARNING: Very sparse rewards! MCTS may struggle to learn.")
+            else:
+                logging.info(f"  Reward Stats: No nodes evaluated in this step")
+            
+            if top_k > 0:
+                logging.info(f"  Top-{top_k} Nodes by Visits:")
+                for i in range(min(5, top_k)):  # Show top 5
+                    logging.info(f"    Node {top_indices[i].item()}: "
+                               f"visits={top_visits[i].item()}, Q={top_Q[i].item():.4f}")
+            logging.info(f"{'='*80}\n")
+    
+    def _log_final_debug_summary(self, tree: BatchedMctsTree, results: List[List[Tuple]], batch_size: int):
+        """
+        Log final summary including diversity analysis and search path visualization.
+        """
+        logging.info(f"\n{'='*80}")
+        logging.info(f"[FINAL DEBUG SUMMARY]")
+        logging.info(f"{'='*80}")
+        
+        # Analyze first sample in detail
+        sample_idx = 0
+        if sample_idx < len(results):
+            sample_results = results[sample_idx]
+            
+            logging.info(f"\nSample {sample_idx} Analysis:")
+            logging.info(f"  Total molecules generated: {len(sample_results)}")
+            
+            if len(sample_results) > 0:
+                # Diversity analysis
+                unique_smiles = set(smi for smi, _, _ in sample_results)
+                logging.info(f"  Unique molecules: {len(unique_smiles)}")
+                logging.info(f"  Diversity ratio: {len(unique_smiles) / len(sample_results):.2%}")
+                
+                if len(unique_smiles) / len(sample_results) < 0.5:
+                    logging.info(f"  ⚠️  WARNING: Low diversity! MCTS may be stuck in local optimum.")
+                
+                # Score distribution
+                scores = [score for _, score, _ in sample_results]
+                logging.info(f"  Score distribution:")
+                logging.info(f"    - Mean: {np.mean(scores):.4f}")
+                logging.info(f"    - Std:  {np.std(scores):.4f}")
+                logging.info(f"    - Min:  {np.min(scores):.4f}")
+                logging.info(f"    - Max:  {np.max(scores):.4f}")
+                
+                # Show top-5 molecules
+                logging.info(f"\n  Top-5 molecules:")
+                for i, (smi, score, mol) in enumerate(sample_results[:5]):
+                    logging.info(f"    {i+1}. SMILES: {smi}")
+                    logging.info(f"       Score: {score:.4f}")
+        
+        # Tree growth visualization
+        if len(self.debug_metrics['tree_size_history']) > 0:
+            logging.info(f"\n  Tree Growth Over Time:")
+            steps = self.debug_metrics['simulation_step_markers']
+            sizes = self.debug_metrics['tree_size_history']
+            
+            # Sample every 10th point for compact display
+            sample_rate = max(1, len(steps) // 10)
+            for i in range(0, len(steps), sample_rate):
+                logging.info(f"    Step {steps[i]:4d}: {sizes[i]:5d} nodes")
+            
+            # Check if tree is growing steadily
+            if len(sizes) > 1:
+                growth_rate = (sizes[-1] - sizes[0]) / len(sizes)
+                logging.info(f"  Average growth rate: {growth_rate:.2f} nodes/checkpoint")
+                if growth_rate < 1.0:
+                    logging.info(f"  ⚠️  WARNING: Tree growth stalled! Check terminal node handling.")
+        
+        # Reward distribution histogram
+        if len(self.debug_metrics['reward_history']) > 0:
+            logging.info(f"\n  Reward Distribution Histogram:")
+            rewards = np.array(self.debug_metrics['reward_history'])
+            
+            # Create histogram
+            hist, bin_edges = np.histogram(rewards, bins=10)
+            for i in range(len(hist)):
+                bar = '█' * int(hist[i] / max(hist) * 50) if max(hist) > 0 else ''
+                logging.info(f"    [{bin_edges[i]:.3f}, {bin_edges[i+1]:.3f}): {bar} ({hist[i]})")
+        
+        # Q-value trends
+        if len(self.debug_metrics['q_value_history']) > 0:
+            logging.info(f"\n  Q-value Trends (Top Node):")
+            for entry in self.debug_metrics['q_value_history'][::max(1, len(self.debug_metrics['q_value_history'])//5)]:
+                step = entry['step']
+                top_Q = entry['top_Q'][0] if len(entry['top_Q']) > 0 else 0.0
+                logging.info(f"    Step {step:4d}: Q = {top_Q:.4f}")
+        
+        logging.info(f"{'='*80}\n")
+    
+    def _save_debug_metrics(self):
+        """
+        Save debug metrics to a pickle file for later analysis.
+        
+        Creates a timestamped file in the current output directory.
+        """
+        import pickle
+        from pathlib import Path
+        
+        # Create debug_metrics directory in the current output directory
+        output_dir = Path.cwd() / 'debug_metrics'
+        output_dir.mkdir(exist_ok=True)
+        
+        # Generate timestamped filename
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        filename = f"mcts_debug_metrics_{timestamp}.pkl"
+        filepath = output_dir / filename
+        
+        try:
+            with open(filepath, 'wb') as f:
+                pickle.dump(self.debug_metrics, f)
+            logging.info(f"\n[DEBUG] Metrics saved to: {filepath}")
+            logging.info(f"[DEBUG] To visualize: python examples/analyze_debug_metrics.py {filepath}\n")
+        except Exception as e:
+            logging.warning(f"[DEBUG] Failed to save metrics: {e}")
+    
+    def _save_tree_structure(self, tree: BatchedMctsTree, sample_idx: int = 0):
+        """
+        Save tree structure for visualization.
+        
+        Exports tree topology, node properties, and relationships to JSON
+        for external visualization tools.
+        
+        Args:
+            tree: BatchedMctsTree after search completion
+            sample_idx: Which sample's tree to save (default: 0)
+        """
+        import json
+        from pathlib import Path
+        
+        output_dir = Path.cwd() / 'debug_metrics'
+        output_dir.mkdir(exist_ok=True)
+        
+        # Collect tree data for the specified sample
+        num_nodes = tree.num_nodes[sample_idx].item()
+        
+        nodes = []
+        edges = []
+        
+        for node_id in range(num_nodes):
+            if tree.node_visits[sample_idx, node_id].item() == 0:
+                continue  # Skip unvisited nodes
+            
+            # Node properties
+            node_data = {
+                'id': int(node_id),
+                'visits': int(tree.node_visits[sample_idx, node_id].item()),
+                'value': float(tree.node_values[sample_idx, node_id].item()),
+                'reward': float(tree.node_rewards[sample_idx, node_id].item()),
+                'q_value': float(tree.node_values[sample_idx, node_id].item() / max(1, tree.node_visits[sample_idx, node_id].item())),
+                'timestep': int(tree.node_timesteps_int[sample_idx, node_id].item()),
+                'is_terminal': bool(tree.is_terminal[sample_idx, node_id].item()),
+            }
+            nodes.append(node_data)
+            
+            # Parent-child edges
+            parent_id = tree.parents[sample_idx, node_id].item()
+            if parent_id != BatchedMctsTree.NO_PARENT and parent_id >= 0:
+                edges.append({
+                    'source': int(parent_id),
+                    'target': int(node_id),
+                })
+        
+        tree_data = {
+            'sample_idx': sample_idx,
+            'num_nodes': num_nodes,
+            'num_visited': len(nodes),
+            'nodes': nodes,
+            'edges': edges,
+            'config': {
+                'branch_k': tree.branch_k,
+                'c_puct': self.mcts_config['c_puct'],
+                'expand_steps': self.mcts_config['expand_steps'],
+                'prediffuse_steps': self.mcts_config['prediffuse_steps'],
+            }
+        }
+        
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        filename = f"mcts_tree_structure_{timestamp}_sample{sample_idx}.json"
+        filepath = output_dir / filename
+        
+        try:
+            with open(filepath, 'w') as f:
+                json.dump(tree_data, f, indent=2)
+            logging.info(f"[DEBUG] Tree structure saved to: {filepath}")
+            logging.info(f"[DEBUG] To visualize: python examples/visualize_tree.py {filepath}")
+        except Exception as e:
+            logging.warning(f"[DEBUG] Failed to save tree structure: {e}")
+    
     # ==================== Batched MCTS Methods ====================
     # These methods replace the sequential MCTS with batched operations
     
@@ -1662,7 +1990,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 for original_idx in mol_indices_map[smi]:
                     batch_scores[original_idx] = score
 
-            logging.info(f"Time taken for scoring: {time.time() - current_time} seconds")
+            # logging.info(f"Time taken for scoring: {time.time() - current_time} seconds")
 
             # Convert to tensor if needed (verifier may return numpy array or list)
             if isinstance(batch_scores, torch.Tensor):
