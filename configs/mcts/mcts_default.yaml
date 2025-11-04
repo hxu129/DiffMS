@@ -22,3 +22,5 @@ bins_count: 15000
 num_workers: 16
 
 expand_steps: 10
+
+cache_dir: '/local3/ericjiang/wgc/huaxu/ms/DiffMS/cache/mcts/'

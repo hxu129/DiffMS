@@ -39,10 +39,6 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message='.*non-writable.*')
 
 # Global worker state (initialized once per worker process)
-_worker_gen_model = None
-_worker_inten_tp = None
-
-# Global worker state (initialized once per worker process)
 _worker_joint_model = None
 cosine = similarity.CosineGreedy(tolerance=0.01)
 def _bin_and_score_vectorized(pred_spec: np.ndarray, target_spec: np.ndarray, 
@@ -74,11 +70,9 @@ def _bin_and_score_vectorized(pred_spec: np.ndarray, target_spec: np.ndarray,
 
     return cosine_score
 
-def _init_worker(gen_checkpoint, inten_checkpoint, device, shared_cache_spec, shared_cache_score):
+def _init_worker(gen_checkpoint, inten_checkpoint, device):
     """Initialize worker with a complete JointModel."""
     global _worker_joint_model
-    global _worker_cache_spec
-    global _worker_cache_score
 
     # Suppress warnings in worker processes
     import warnings
@@ -109,15 +103,11 @@ def _init_worker(gen_checkpoint, inten_checkpoint, device, shared_cache_spec, sh
     _worker_joint_model.eval()
     _worker_joint_model.to(device)
 
-    # Use shared cache passed from main process
-    _worker_cache_spec = shared_cache_spec
-    _worker_cache_score = shared_cache_score
-
 @torch.no_grad()
 def _worker_predict_and_score_spectrum(args):
     """
     Worker function that performs the ENTIRE prediction pipeline
-    and returns only the final spectrum array.
+    and returns (score, spectrum, spec_cache_key, score_cache_key).
     """
     # Suppress warnings in worker processes
     import warnings
@@ -134,34 +124,21 @@ def _worker_predict_and_score_spectrum(args):
     warnings.filterwarnings('ignore', category=DeprecationWarning)
 
     global _worker_joint_model
-    global _worker_cache_spec
-    global _worker_cache_score
-    mol, t_spec, adduct, device, bin_size = args
+    mol, smi, t_spec, adduct, device, bin_size, spec_cache_key, score_cache_key = args
 
     # stage 1: predict the spectrum
     try:
-        # predict_mol is a method of the JointModel class
-        smi = Chem.MolToSmiles(mol, canonical=True)
-        hash_key = smi + adduct + sha256(t_spec.tobytes()).hexdigest()
-        if hash_key in _worker_cache_score:
-            score = _worker_cache_score[hash_key]
-            return score
-        
-        if smi+adduct in _worker_cache_spec:
-            p_spec = _worker_cache_spec[smi+adduct]
-        else:
-            output = _worker_joint_model.predict_mol(
-                mol=mol,
-                smi=smi,
-                adduct=adduct,
-                threshold=0.0,
-                device=device,
-                max_nodes=100,
-                binned_out=False,
-            )
+        output = _worker_joint_model.predict_mol(
+            mol=mol,
+            smi=smi,
+            adduct=adduct,
+            threshold=0.0,
+            device=device,
+            max_nodes=100,
+            binned_out=False,
+        )
         
         # Aggregate fragments into a final spectrum array
-        # This is the same logic you already have in _aggregate_fragments_to_spectrum
         from collections import defaultdict
         
         frags = output.get('frags', {})
@@ -182,8 +159,6 @@ def _worker_predict_and_score_spectrum(args):
         logging.error(f"Worker error on SMILES {smi}: {e}")
         p_spec = np.array([[0.0, 0.0]])
 
-    _worker_cache_spec[smi+adduct] = p_spec
-
     # stage 2: score the spectrum
     try:
         score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, bin_size=bin_size)
@@ -191,8 +166,7 @@ def _worker_predict_and_score_spectrum(args):
         logging.error(f"Worker error on scoring spectrum {smi}: {e}")
         score = 0.0
     
-    _worker_cache_score[hash_key] = score
-    return score
+    return (score, p_spec, spec_cache_key, score_cache_key)
 
 class BaseVerifier:
     """Abstract verifier interface.
@@ -218,30 +192,40 @@ class IcebergVerifier(BaseVerifier):
                  tolerance_da: float = 0.01,
                  bins_upper_mz: float = 1500.0,
                  bins_count: int = 15000,
-                 num_workers: int = 8):
+                 num_workers: int = 8,
+                 cache_dir: str = './cache/mcts/'):
         from ms_pred.dag_pred import joint_model as iceberg_joint
         from matchms.similarity import CosineGreedy
+        import os
 
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        # The main process no longer needs the full model, only the verifier parts
-        # Create persistent worker pool with the new initializer
         self.num_workers = num_workers
+        self.cache_dir = cache_dir
+        
+        # Create cache directory if it doesn't exist
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Define cache file paths
+        self.spectra_cache_path = os.path.join(cache_dir, 'spectra_cache.pkl')
+        self.scores_cache_path = os.path.join(cache_dir, 'scores_cache.pkl')
+        
+        # Load persistent caches from disk
+        self.spectra_cache = self._load_cache(self.spectra_cache_path)
+        self.scores_cache = self._load_cache(self.scores_cache_path)
+        logging.info(f"Loaded persistent caches: {len(self.spectra_cache)} spectra, {len(self.scores_cache)} scores")
+        
+        # Initialize batch counter for periodic saves
+        self.batch_counter = 0
+        self.save_every_n_batches = 10
+        
+        # Create persistent worker pool
         ctx = mp.get_context('spawn')
-        
-        # Decide the device for workers. For this CPU-heavy task, 'cpu' is best.
-        worker_device = 'cpu'
-        
-        # Create shared cache using Manager
-        self.manager = ctx.Manager()
-        self.shared_cache_spec = self.manager.dict()
-        self.shared_cache_score = self.manager.dict()
-        logging.info(f"Created shared cache for {num_workers} workers")
+        worker_device = 'cpu'  # CPU is best for this task
         
         self.worker_pool = ctx.Pool(
             processes=num_workers,
             initializer=_init_worker,
-            # Pass checkpoints, device, and shared cache to workers
-            initargs=(gen_checkpoint, inten_checkpoint, worker_device, self.shared_cache_spec, self.shared_cache_score)
+            initargs=(gen_checkpoint, inten_checkpoint, worker_device)
         )
         logging.info(f"Initialized persistent worker pool with {num_workers} workers on device '{worker_device}'")
 
@@ -249,25 +233,64 @@ class IcebergVerifier(BaseVerifier):
         self.tolerance_da = float(tolerance_da)
         self.bins_upper_mz = float(bins_upper_mz)
         self.bins_count = int(bins_count)
+    
+    def _load_cache(self, cache_path: str) -> dict:
+        """Load cache from pickle file, return empty dict if not exists."""
+        import pickle
+        import os
         
-        # # Cache FULL ICEBERG outputs: (canonical_smiles, adduct) -> output_dict
-        # self.iceberg_output_cache = OrderedDict()
-        # self.cache_max_size = 500
-        # self.global_rank = 0
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as f:
+                    cache = pickle.load(f)
+                logging.info(f"Loaded cache from {cache_path}: {len(cache)} entries")
+                return cache
+            except Exception as e:
+                logging.warning(f"Failed to load cache from {cache_path}: {e}. Starting with empty cache.")
+                return {}
+        else:
+            logging.info(f"No cache file found at {cache_path}. Starting with empty cache.")
+            return {}
+    
+    def _save_cache(self, cache: dict, cache_path: str):
+        """Atomically save dict to pickle file using temp file + rename."""
+        import pickle
+        import os
+        
+        temp_path = cache_path + '.tmp'
+        try:
+            with open(temp_path, 'wb') as f:
+                pickle.dump(cache, f, protocol=4)
+            os.replace(temp_path, cache_path)
+            logging.info(f"Saved cache to {cache_path}: {len(cache)} entries")
+        except Exception as e:
+            logging.error(f"Failed to save cache to {cache_path}: {e}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+    
+    def _save_caches_to_disk(self):
+        """Save both spectra and scores caches to disk."""
+        self._save_cache(self.spectra_cache, self.spectra_cache_path)
+        self._save_cache(self.scores_cache, self.scores_cache_path)
     
     def __del__(self):
-        """Cleanup worker pool and manager on deletion."""
+        """Cleanup: save caches and close worker pool."""
+        # Save caches before cleanup
+        if hasattr(self, 'spectra_cache') and hasattr(self, 'scores_cache'):
+            logging.info("Saving caches before cleanup...")
+            self._save_caches_to_disk()
+        
+        # Close worker pool
         if hasattr(self, 'worker_pool') and self.worker_pool is not None:
             self.worker_pool.close()
             self.worker_pool.join()
-        if hasattr(self, 'manager') and self.manager is not None:
-            self.manager.shutdown()
     
     def get_cache_stats(self):
-        """Get statistics about the shared cache."""
+        """Get statistics about the persistent cache."""
         return {
-            'cache_size': len(self.shared_cache_spec),
-            'cache_keys_sample': list(self.shared_cache_spec.keys())[:5] if len(self.shared_cache_spec) > 0 else []
+            'spectra_cache_size': len(self.spectra_cache),
+            'scores_cache_size': len(self.scores_cache),
+            'cache_dir': self.cache_dir
         }
 
     @torch.no_grad()
@@ -280,23 +303,78 @@ class IcebergVerifier(BaseVerifier):
                    collision_engs: List[Optional[float]],
                    target_spectra_list: List[np.ndarray],
                    bin_size: float = 1.0) -> List[float]:
-        """Batched scoring with persistent worker pool and caching."""
+        """Batched scoring with pre-filtering and persistent caching."""
         if not mol_list:
             return []
         
-        worker_device = 'cpu'  # Matching the device used in the initializer
+        worker_device = 'cpu'
         bin_size = float(bin_size)
-
-        worker_args = [
-            (mol, t_spec, adduct, worker_device, bin_size)
-            for mol, t_spec, adduct in zip(mol_list, target_spectra_list, adducts)
-        ]
-
-        # This now returns a list of scores
-        current_time = time.time()
-        scores = self.worker_pool.map(_worker_predict_and_score_spectrum, worker_args)
-        logging.info(f"Time taken for predicting and scoring spectra: {time.time() - current_time} seconds")
-
+        
+        # Phase 1: Pre-filter using cache (BEFORE multiprocessing)
+        # This is the key optimization: check cache first to avoid worker pool overhead
+        scores = [None] * len(mol_list)  # Initialize results
+        worker_args = []  # Only uncached items
+        worker_indices = []  # Track original positions
+        
+        cache_hits_score = 0
+        cache_hits_spec = 0
+        cache_misses = 0
+        
+        for i, (mol, smi, adduct, t_spec) in enumerate(zip(mol_list, smiles_list, adducts, target_spectra_list)):
+            # Create cache keys
+            spec_cache_key = (smi, adduct)
+            target_hash = sha256(t_spec.tobytes()).hexdigest()
+            score_cache_key = (smi, adduct, target_hash, bin_size)
+            
+            # Check if score is already cached
+            if score_cache_key in self.scores_cache:
+                scores[i] = self.scores_cache[score_cache_key]
+                cache_hits_score += 1
+                continue
+            
+            # Score not cached - need to compute it
+            # Check if spectrum is cached (partial hit)
+            if spec_cache_key in self.spectra_cache:
+                # Spectrum cached, only need to score it
+                p_spec = self.spectra_cache[spec_cache_key]
+                try:
+                    score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, bin_size=bin_size)
+                except Exception as e:
+                    logging.error(f"Scoring error for {smi}: {e}")
+                    score = 0.0
+                
+                scores[i] = score
+                self.scores_cache[score_cache_key] = score
+                cache_hits_spec += 1
+                continue
+            
+            # Neither spectrum nor score cached - need full computation
+            cache_misses += 1
+            worker_args.append((mol, smi, t_spec, adduct, worker_device, bin_size, spec_cache_key, score_cache_key))
+            worker_indices.append(i)
+        
+        logging.info(f"Cache stats: {cache_hits_score} score hits, {cache_hits_spec} spectrum hits, {cache_misses} misses (need worker pool)")
+        
+        # Phase 2: Compute uncached items using worker pool
+        if worker_args:
+            current_time = time.time()
+            worker_results = self.worker_pool.map(_worker_predict_and_score_spectrum, worker_args)
+            logging.info(f"Worker pool computed {len(worker_args)} items in {time.time() - current_time:.2f}s")
+            
+            # Phase 3: Merge results and update caches
+            for idx, (score, p_spec, spec_cache_key, score_cache_key) in zip(worker_indices, worker_results):
+                scores[idx] = score
+                # Update both caches
+                self.spectra_cache[spec_cache_key] = p_spec
+                self.scores_cache[score_cache_key] = score
+        
+        # Phase 4: Periodic save to disk
+        self.batch_counter += 1
+        if self.batch_counter >= self.save_every_n_batches:
+            logging.info(f"Periodic cache save triggered (batch {self.batch_counter})")
+            self._save_caches_to_disk()
+            self.batch_counter = 0
+        
         return scores
 
 def build_verifier(cfg) -> BaseVerifier:
@@ -309,6 +387,7 @@ def build_verifier(cfg) -> BaseVerifier:
       - optional: cfg.mcts.similarity.tolerance_da (float)
       - optional: cfg.mcts.bins_upper_mz, cfg.mcts.bins_count
       - optional: cfg.mcts.num_workers (int, default 8)
+      - optional: cfg.mcts.cache_dir (str, default './cache/mcts/')
     """
     vt = getattr(cfg.mcts, 'verifier_type', 'iceberg')
     if vt == 'iceberg':
@@ -317,6 +396,7 @@ def build_verifier(cfg) -> BaseVerifier:
         upper = getattr(mcts, 'bins_upper_mz', 1500.0)
         count = getattr(mcts, 'bins_count', 15000)
         num_workers = getattr(mcts, 'num_workers', 8)  # Default 8 workers
+        cache_dir = getattr(mcts, 'cache_dir', './cache/mcts/')  # Default cache directory
         return IcebergVerifier(
             gen_checkpoint=mcts.iceberg.gen_checkpoint,
             inten_checkpoint=mcts.iceberg.inten_checkpoint,
@@ -324,6 +404,7 @@ def build_verifier(cfg) -> BaseVerifier:
             bins_upper_mz=upper,
             bins_count=count,
             num_workers=num_workers,
+            cache_dir=cache_dir,
         )
     else:
         raise ValueError(f"Unsupported verifier_type: {vt}")
