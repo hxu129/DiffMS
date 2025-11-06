@@ -6,6 +6,11 @@ time_budget_s: 0.0
 verifier_batch_size: 32
 prediffuse_steps: 10
 
+# Debug logging - detailed metrics for MCTS debugging
+# Tracks: tree size, visit counts, reward distribution, Q-values, diversity
+# Warning: Increases memory usage and log file size
+debug_logging: false
+
 verifier_type: 'iceberg'
 
 iceberg:
