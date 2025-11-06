@@ -1,6 +1,6 @@
 HYDRA_FULL_ERROR=1 CUDA_VISIBLE_DEVICES=1 python src/spec2mol_main.py \
-    train.eval_batch_size=128 \
-    dataset.max_count=null \
+    train.eval_batch_size=16 \
+    dataset.max_count=2000 \
     general.validate_only=/local3/ericjiang/wgc/huaxu/ms/DiffMS/checkpoints/diffms_canopus.ckpt \
     general.name=test-offline-cache \
     general.wandb_name=test \
@@ -14,8 +14,8 @@ HYDRA_FULL_ERROR=1 CUDA_VISIBLE_DEVICES=1 python src/spec2mol_main.py \
     mcts.time_budget_s=0.0 \
     mcts.verifier_batch_size=32 \
     mcts.verifier_type=iceberg \
-    mcts.num_workers=64 \
+    mcts.num_workers=16 \
     mcts.prediffuse_steps=0 \
     mcts.expand_steps=20 \
-    mcts.similarity.bin_size=20.0
+    mcts.similarity.bin_size=10.0
     # general.test_only=/local3/ericjiang/wgc/huaxu/ms/DiffMS/checkpoints/diffms_canopus.ckpt \

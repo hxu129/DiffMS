@@ -580,9 +580,15 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
     def _terminal_check_and_smiles(self, X_0: torch.Tensor, E_0: torch.Tensor) -> Tuple[bool, Optional[str], Optional[Chem.Mol]]:
 
         mol = self.visualization_tools.mol_from_graphs(X_0, E_0)
+        # Get the fragment with highest molecular weights (using atom count as proxy)
+        fragments = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False)
+        if not fragments:
+            return False, None, None
+    
+        max_weight_fragment = max(fragments, key=lambda x: x.GetNumAtoms())
         try:
-            smi = Chem.MolToSmiles(mol)
-            return True, smi, mol
+            smi = Chem.MolToSmiles(max_weight_fragment)
+            return True, smi, max_weight_fragment
         except:
             return False, None, None
 
