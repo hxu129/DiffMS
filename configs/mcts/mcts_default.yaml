@@ -13,6 +13,9 @@ debug_logging: false
 
 verifier_type: 'iceberg'
 
+graffms: 
+  checkpoint: '/local3/ericjiang/wgc/huaxu/ms/ms-pred/results/graff_ms_baseline_canopus_train_public/split_4_rnd1/version_0/best.ckpt'
+
 iceberg:
   gen_checkpoint: '/local3/ericjiang/wgc/huaxu/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_generate.ckpt'
   inten_checkpoint: '/local3/ericjiang/wgc/huaxu/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_score.ckpt'
@@ -28,4 +31,4 @@ num_workers: 16
 
 expand_steps: 10
 
-cache_dir: '/local3/ericjiang/wgc/huaxu/ms/DiffMS/cache/mcts/'
+cache_dir: '/local3/ericjiang/wgc/huaxu/ms/DiffMS/cache/graffms/'
