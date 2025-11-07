@@ -11,6 +11,7 @@ if 'rdkit' not in sys.modules:
 
 import numpy as np
 import torch
+import torch.nn as nn
 from rdkit import Chem
 from typing import Union, Optional, List
 from collections import defaultdict
@@ -207,7 +208,7 @@ def _worker_predict_and_score_spectrum(args):
 
     # stage 2: score the spectrum
     try:
-        score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, bin_size=bin_size, mz_max=self.bins_upper_mz)
+        score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, bin_size=bin_size, mz_max=1500.0)
     except Exception as e:
         logging.error(f"Worker error on scoring spectrum {smi}: {e}")
         score = 0.0
@@ -282,7 +283,7 @@ def _worker_predict_and_score_spectrum_graff(args):
 
     # Stage 2: Score the spectrum
     try:
-        score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, bin_size=bin_size, mz_max=self.bins_upper_mz)
+        score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, bin_size=bin_size, mz_max=1500.0)
     except Exception as e:
         logging.error(f"Worker error on scoring spectrum {smi}: {e}")
         score = 0.0
@@ -499,21 +500,39 @@ class IcebergVerifier(BaseVerifier):
         return scores
 
 class GraffMSVerifier(BaseVerifier):
+    """GPU-batched GraffMS verifier with optional multi-GPU support and persistent caching."""
+    
     def __init__(self,
                  checkpoint: str,
                  device: Optional[str] = None,
                  tolerance_da: float = 0.01,
                  bins_upper_mz: float = 1500.0,
                  bins_count: int = 15000,
-                 num_workers: int = 8,
+                 inference_batch_size: int = 32,
+                 use_multi_gpu: bool = False,
                  cache_dir: str = './cache/mcts/'):
+        """
+        GPU-batched GraffMS verifier - optimized for speed with persistent caching.
+        
+        Args:
+            checkpoint: Path to GraffMS model checkpoint
+            device: Device to use (default: 'cuda' if available)
+            tolerance_da: Tolerance for cosine similarity
+            bins_upper_mz: Upper m/z limit for binning
+            bins_count: Number of bins
+            inference_batch_size: Batch size for GPU inference (default 32)
+            use_multi_gpu: If True, use DataParallel for multi-GPU (default False)
+            cache_dir: Directory for persistent caching
+        """
         from matchms.similarity import CosineGreedy
         import os
 
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.num_workers = num_workers
+        self.inference_batch_size = inference_batch_size
+        self.use_multi_gpu = use_multi_gpu
+        self.bins_upper_mz = float(bins_upper_mz)
+        self.bins_count = int(bins_count)
         self.cache_dir = cache_dir
-        self.checkpoint = checkpoint
         
         # Create cache directory if it doesn't exist
         os.makedirs(cache_dir, exist_ok=True)
@@ -525,27 +544,46 @@ class GraffMSVerifier(BaseVerifier):
         # Load persistent caches from disk
         self.spectra_cache = self._load_cache(self.spectra_cache_path)
         self.scores_cache = self._load_cache(self.scores_cache_path)
-        logging.info(f"Loaded GraffMS persistent caches: {len(self.spectra_cache)} spectra, {len(self.scores_cache)} scores")
+        logging.info(f"Loaded persistent caches: {len(self.spectra_cache)} spectra, {len(self.scores_cache)} scores")
         
         # Initialize batch counter for periodic saves
         self.batch_counter = 0
         self.save_every_n_batches = 50
         
-        # Create persistent worker pool
-        ctx = mp.get_context('spawn')
-        worker_device = 'cpu'  # CPU is best for this task
+        # Load model on GPU (NOT CPU workers!)
+        from ms_pred.graff_ms import graff_ms_model
+        import ms_pred.nn_utils as nn_utils
         
-        self.worker_pool = ctx.Pool(
-            processes=num_workers,
-            initializer=_init_worker_graff,
-            initargs=(checkpoint, worker_device)
+        logging.info(f"Loading GraffMS model from {checkpoint} on device '{self.device}'")
+        self.model = graff_ms_model.GraffGNN.load_from_checkpoint(
+            checkpoint,
+            map_location=self.device
         )
-        logging.info(f"Initialized GraffMS persistent worker pool with {num_workers} workers on device '{worker_device}'")
-
+        self.model.eval()
+        self.model.to(self.device)
+        
+        # Multi-GPU setup
+        if self.use_multi_gpu and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            num_gpus = torch.cuda.device_count()
+            logging.info(f"Enabling DataParallel across {num_gpus} GPUs")
+            self.model = nn.DataParallel(self.model)
+            # Increase batch size proportionally
+            self.inference_batch_size *= num_gpus
+            logging.info(f"Adjusted batch size to {self.inference_batch_size} for multi-GPU")
+        
+        # Get model attributes (handle DataParallel wrapper)
+        model_for_attrs = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        
+        # Create graph featurizer (CPU operation)
+        self.graph_featurizer = nn_utils.MolDGLGraph(
+            atom_feats=model_for_attrs.atom_feats,
+            bond_feats=model_for_attrs.bond_feats,
+            pe_embed_k=model_for_attrs.pe_embed_k,
+        )
+        logging.info(f"Initialized GraffMS GPU-batched verifier (batch_size={self.inference_batch_size}, caching=True)")
+        
         self.cosine = CosineGreedy(tolerance=tolerance_da)
         self.tolerance_da = float(tolerance_da)
-        self.bins_upper_mz = float(bins_upper_mz)
-        self.bins_count = int(bins_count)
     
     def _load_cache(self, cache_path: str) -> dict:
         """Load cache from pickle file, return empty dict if not exists."""
@@ -587,16 +625,10 @@ class GraffMSVerifier(BaseVerifier):
         self._save_cache(self.scores_cache, self.scores_cache_path)
     
     def __del__(self):
-        """Cleanup: save caches and close worker pool."""
-        # Save caches before cleanup
+        """Cleanup: save caches."""
         if hasattr(self, 'spectra_cache') and hasattr(self, 'scores_cache'):
-            logging.info("Saving GraffMS caches before cleanup...")
+            logging.info("Saving caches before cleanup...")
             self._save_caches_to_disk()
-        
-        # Close worker pool
-        if hasattr(self, 'worker_pool') and self.worker_pool is not None:
-            self.worker_pool.close()
-            self.worker_pool.join()
     
     def get_cache_stats(self):
         """Get statistics about the persistent cache."""
@@ -605,6 +637,7 @@ class GraffMSVerifier(BaseVerifier):
             'scores_cache_size': len(self.scores_cache),
             'cache_dir': self.cache_dir
         }
+    
 
     @torch.no_grad()
     def score_batch(self,
@@ -616,18 +649,20 @@ class GraffMSVerifier(BaseVerifier):
                    collision_engs: List[Optional[float]],
                    target_spectra_list: List[np.ndarray],
                    bin_size: float = 1.0) -> List[float]:
-        """Batched scoring with pre-filtering and persistent caching."""
+        """GPU-batched scoring with persistent caching."""
         if not mol_list:
             return []
         
-        worker_device = 'cpu'
         bin_size = float(bin_size)
+        num_mols = len(mol_list)
         
-        # Phase 1: Pre-filter using cache (BEFORE multiprocessing)
-        # This is the key optimization: check cache first to avoid worker pool overhead
-        scores = [None] * len(mol_list)  # Initialize results
-        worker_args = []  # Only uncached items
-        worker_indices = []  # Track original positions
+        # Phase 1: Pre-filter using cache
+        scores = [None] * num_mols  # Initialize results
+        uncached_indices = []  # Track which items need GPU inference
+        uncached_mols = []
+        uncached_smiles = []
+        uncached_adducts = []
+        uncached_specs = []
         
         cache_hits_score = 0
         cache_hits_spec = 0
@@ -645,13 +680,13 @@ class GraffMSVerifier(BaseVerifier):
                 cache_hits_score += 1
                 continue
             
-            # Score not cached - need to compute it
-            # Check if spectrum is cached (partial hit)
+            # Score not cached - check if spectrum is cached (partial hit)
             if spec_cache_key in self.spectra_cache:
                 # Spectrum cached, only need to score it
                 p_spec = self.spectra_cache[spec_cache_key]
                 try:
-                    score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, bin_size=bin_size)
+                    score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, 
+                                                     bin_size=bin_size, mz_max=self.bins_upper_mz)
                 except Exception as e:
                     logging.error(f"Scoring error for {smi}: {e}")
                     score = 0.0
@@ -663,28 +698,89 @@ class GraffMSVerifier(BaseVerifier):
             
             # Neither spectrum nor score cached - need full computation
             cache_misses += 1
-            worker_args.append((mol, smi, t_spec, adduct, worker_device, bin_size, spec_cache_key, score_cache_key))
-            worker_indices.append(i)
+            uncached_indices.append(i)
+            uncached_mols.append(mol)
+            uncached_smiles.append(smi)
+            uncached_adducts.append(adduct)
+            uncached_specs.append(t_spec)
         
-        logging.info(f"GraffMS Cache stats: {cache_hits_score} score hits, {cache_hits_spec} spectrum hits, {cache_misses} misses (need worker pool)")
+        logging.info(f"Cache stats: {cache_hits_score} score hits, {cache_hits_spec} spectrum hits, {cache_misses} misses (need GPU)")
         
-        # Phase 2: Compute uncached items using worker pool
-        if worker_args:
+        # Phase 2: GPU batch inference for uncached items
+        if uncached_mols:
             current_time = time.time()
-            worker_results = self.worker_pool.map(_worker_predict_and_score_spectrum_graff, worker_args)
-            logging.info(f"GraffMS Worker pool computed {len(worker_args)} items in {time.time() - current_time:.2f}s")
             
-            # Phase 3: Merge results and update caches
-            for idx, (score, p_spec, spec_cache_key, score_cache_key) in zip(worker_indices, worker_results):
-                scores[idx] = score
-                # Update both caches
-                self.spectra_cache[spec_cache_key] = p_spec
-                self.scores_cache[score_cache_key] = score
+            # Process uncached items in GPU batches
+            for batch_start in range(0, len(uncached_mols), self.inference_batch_size):
+                batch_end = min(batch_start + self.inference_batch_size, len(uncached_mols))
+                batch_mols = uncached_mols[batch_start:batch_end]
+                batch_smiles = uncached_smiles[batch_start:batch_end]
+                batch_adducts = uncached_adducts[batch_start:batch_end]
+                batch_specs = uncached_specs[batch_start:batch_end]
+                batch_indices = uncached_indices[batch_start:batch_end]
+                
+                # Ensure molecules are properly sanitized for RDKit operations
+                for mol in batch_mols:
+                    try:
+                        Chem.SanitizeMol(mol)
+                    except:
+                        # If sanitization fails, try to at least calculate valence
+                        try:
+                            for atom in mol.GetAtoms():
+                                atom.UpdatePropertyCache(strict=False)
+                        except Exception as e:
+                            logging.error(f"Error updating property cache for molecule: {e}")
+                
+                # Convert molecules to graphs (CPU)
+                batch_graphs = [self.graph_featurizer.get_dgl_graph(mol) for mol in batch_mols]
+                batch_forms = [torch.FloatTensor(common.formula_to_dense(
+                    common.uncharged_formula(mol, mol_type="mol")
+                )) for mol in batch_mols]
+                batch_adduct_indices = [common.ion2onehot_pos[adduct] for adduct in batch_adducts]
+
+                # Batch and transfer to GPU
+                batched_graphs = dgl.batch(batch_graphs).to(self.device)
+                batched_forms = torch.stack(batch_forms).to(self.device)
+                batched_adducts = torch.FloatTensor(batch_adduct_indices).to(self.device)
+                
+                # Single forward pass for entire batch!
+                output = self.model.predict(batched_graphs, batched_forms, batched_adducts)
+                binned_specs = output["spec"].cpu().detach().numpy()  # [batch_size, num_bins]
+                
+                # Process results - convert to peak lists and score
+                bin_width = self.bins_upper_mz / binned_specs.shape[1]
+                
+                for i, (binned_spec, t_spec, smi, adduct, orig_idx) in enumerate(
+                    zip(binned_specs, batch_specs, batch_smiles, batch_adducts, batch_indices)
+                ):
+                    # Convert binned spec to peak list
+                    peaks = [(idx * bin_width, inten) for idx, inten in enumerate(binned_spec) if inten > 0]
+                    p_spec = np.array(peaks) if peaks else np.array([[0.0, 0.0]])
+                    
+                    # Score
+                    try:
+                        score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec,
+                                                         bin_size=bin_size, mz_max=self.bins_upper_mz)
+                    except Exception as e:
+                        logging.error(f"Scoring error for {smi}: {e}")
+                        score = 0.0
+                    
+                    # Store in result array
+                    scores[orig_idx] = score
+                    
+                    # Update caches
+                    spec_cache_key = (smi, adduct)
+                    target_hash = sha256(t_spec.tobytes()).hexdigest()
+                    score_cache_key = (smi, adduct, target_hash, bin_size)
+                    self.spectra_cache[spec_cache_key] = p_spec
+                    self.scores_cache[score_cache_key] = score
+            
+            logging.info(f"GPU computed {len(uncached_mols)} items in {time.time() - current_time:.2f}s")
         
-        # Phase 4: Periodic save to disk
+        # Phase 3: Periodic save to disk
         self.batch_counter += 1
         if self.batch_counter >= self.save_every_n_batches:
-            logging.info(f"GraffMS Periodic cache save triggered (batch {self.batch_counter})")
+            logging.info(f"Periodic cache save triggered (batch {self.batch_counter})")
             self._save_caches_to_disk()
             self.batch_counter = 0
         
@@ -733,14 +829,16 @@ def build_verifier(cfg) -> BaseVerifier:
         tol = getattr(mcts.similarity, 'tolerance_da', 0.01)
         upper = getattr(mcts, 'bins_upper_mz', 1500.0)
         count = getattr(mcts, 'bins_count', 15000)
-        num_workers = getattr(mcts, 'num_workers', 8)  # Default 8 workers
+        inference_batch_size = getattr(mcts, 'verifier_batch_size', 32)  # GPU batch size
+        use_multi_gpu = getattr(mcts, 'use_multi_gpu', False)  # Multi-GPU flag
         cache_dir = getattr(mcts, 'cache_dir', './cache/mcts/')  # Default cache directory
         return GraffMSVerifier(
             checkpoint=mcts.graffms.checkpoint,
             tolerance_da=tol,
             bins_upper_mz=upper,
             bins_count=count,
-            num_workers=num_workers,
+            inference_batch_size=inference_batch_size,
+            use_multi_gpu=use_multi_gpu,
             cache_dir=cache_dir,
         )
     else:
