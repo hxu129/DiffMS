@@ -14,7 +14,7 @@ debug_logging: false
 verifier_type: 'iceberg'
 
 graffms: 
-  checkpoint: '/local3/ericjiang/wgc/huaxu/ms/ms-pred/results/graff_ms_baseline_canopus_train_public/split_4_rnd1/version_0/best.ckpt'
+  checkpoint: '/local3/ericjiang/wgc/huaxu/ms/ms-pred/results/graff_ms_baseline_canopus_train_public/split_4_rnd1/version_7/best.ckpt'
 
 iceberg:
   gen_checkpoint: '/local3/ericjiang/wgc/huaxu/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_generate.ckpt'

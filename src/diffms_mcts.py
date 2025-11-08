@@ -330,7 +330,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
     def _ensure_verifier(self):
         if self._verifier_ready and self.verifier is not None:
             return
-        self.verifier = build_verifier(self.cfg)
+        self.verifier = build_verifier(self.cfg, ddp_rank=self.global_rank)
         self._verifier_ready = True
 
     def on_validation_epoch_start(self) -> None:
@@ -411,6 +411,15 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         """ Measure likelihood on a test set and compute stability metrics. """
+        # Synchronize all processes before merging (ensure all ranks finished writing)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        
+        # Merge rank-specific prediction files and caches (only on rank 0)
+        # if self.global_rank == 0:
+        #     self._merge_distributed_predictions(stage='val')
+        #     self._merge_distributed_caches()
+        
         metrics = [
             self.val_nll.compute(), 
             self.val_X_kl.compute(), 
@@ -520,6 +529,15 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
     def on_test_epoch_end(self) -> None:
         """ Measure likelihood on a test set and compute stability metrics. """
+        # Synchronize all processes before merging (ensure all ranks finished writing)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        
+        # Merge rank-specific prediction files and caches (only on rank 0)
+        # if self.global_rank == 0:
+        #     self._merge_distributed_predictions(stage='test')
+        #     self._merge_distributed_caches()
+        
         metrics = [
             self.test_nll.compute(), 
             self.test_X_kl.compute(), 
@@ -672,9 +690,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             # 3. Evaluation: score all new children (batched verifier call)
             # Input: [batch_size, K] node indices
             # Output: [batch_size, K] scores
-            # current_time = time.time()
+            current_time = time.time()
             child_scores = self._batched_evaluate(tree, new_child_indices, env_metas, spectra)
-            # logging.info(f"Time taken for scoring: {time.time() - current_time} seconds")
+            logging.info(f"Time taken for scoring: {time.time() - current_time} seconds")
             # 4. Backup: propagate scores up to root
             # Input: [batch_size, K] node indices and scores
             tree = self._batched_backup(tree, new_child_indices, child_scores)
@@ -2110,3 +2128,237 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             current_nodes = new_nodes
             # Values stay the same as we propagate up
         return tree
+    
+    def _merge_distributed_predictions(self, stage: str = 'test'):
+        """
+        Merge prediction files from all GPU ranks into unified outputs.
+        
+        This function should only be called on rank 0 after all ranks have finished
+        saving their predictions. It collects all rank-specific pickle files and
+        merges them in the correct order.
+        
+        Args:
+            stage: 'test' or 'val' to determine which files to merge
+            
+        Output files:
+            - preds/{name}_{stage}_pred_merged.pkl: All predictions merged
+            - preds/{name}_{stage}_true_merged.pkl: All ground truths merged
+        """
+        import glob
+        from pathlib import Path
+        
+        pred_dir = Path('preds')
+        if not pred_dir.exists():
+            logging.warning(f"Predictions directory does not exist: {pred_dir}")
+            return
+        
+        # Determine number of ranks by finding all rank files
+        # Pattern: {name}_rank_{rank}_pred_{batch_idx}.pkl
+        rank_files = sorted(glob.glob(str(pred_dir / f"{self.name}_rank_*_pred_*.pkl")))
+        
+        if len(rank_files) == 0:
+            logging.warning(f"No rank-specific prediction files found for merging")
+            return
+        
+        # Extract unique ranks and batch indices
+        ranks = set()
+        batch_indices = set()
+        for file_path in rank_files:
+            file_name = Path(file_path).stem  # Remove .pkl extension
+            # Parse: {name}_rank_{rank}_pred_{batch_idx}
+            parts = file_name.split('_')
+            # Find 'rank' keyword and extract rank number
+            try:
+                rank_idx = parts.index('rank')
+                rank = int(parts[rank_idx + 1])
+                # Find 'pred' keyword and extract batch index
+                pred_idx = parts.index('pred')
+                batch_idx = int(parts[pred_idx + 1])
+                ranks.add(rank)
+                batch_indices.add(batch_idx)
+            except (ValueError, IndexError) as e:
+                logging.warning(f"Could not parse file name: {file_path}, error: {e}")
+                continue
+        
+        ranks = sorted(ranks)
+        batch_indices = sorted(batch_indices)
+        
+        if not ranks or not batch_indices:
+            logging.warning("Could not determine ranks or batch indices from file names")
+            return
+        
+        logging.info(f"=" * 80)
+        logging.info(f"[POST-PROCESSING] Merging distributed predictions for {stage}")
+        logging.info(f"  Found {len(ranks)} ranks: {ranks}")
+        logging.info(f"  Found {len(batch_indices)} batches: {batch_indices}")
+        logging.info(f"=" * 80)
+        
+        # Merge predictions and ground truths
+        all_predictions = []
+        all_ground_truths = []
+        
+        # Process batches in order, then ranks in order
+        for batch_idx in batch_indices:
+            for rank in ranks:
+                pred_file = pred_dir / f"{self.name}_rank_{rank}_pred_{batch_idx}.pkl"
+                true_file = pred_dir / f"{self.name}_rank_{rank}_true_{batch_idx}.pkl"
+                
+                if pred_file.exists() and true_file.exists():
+                    try:
+                        with open(pred_file, 'rb') as f:
+                            batch_preds = pickle.load(f)
+                        with open(true_file, 'rb') as f:
+                            batch_trues = pickle.load(f)
+                        
+                        # Each file contains a list of predictions/truths for samples in that batch
+                        all_predictions.extend(batch_preds)
+                        all_ground_truths.extend(batch_trues)
+                        
+                        logging.info(f"  Loaded rank {rank}, batch {batch_idx}: "
+                                   f"{len(batch_preds)} samples")
+                    except Exception as e:
+                        logging.warning(f"Failed to load {pred_file} or {true_file}: {e}")
+                else:
+                    if not pred_file.exists():
+                        logging.warning(f"Missing prediction file: {pred_file}")
+                    if not true_file.exists():
+                        logging.warning(f"Missing ground truth file: {true_file}")
+        
+        # Save merged results
+        if len(all_predictions) > 0:
+            merged_pred_file = pred_dir / f"{self.name}_{stage}_pred_merged.pkl"
+            merged_true_file = pred_dir / f"{self.name}_{stage}_true_merged.pkl"
+            
+            try:
+                with open(merged_pred_file, 'wb') as f:
+                    pickle.dump(all_predictions, f)
+                with open(merged_true_file, 'wb') as f:
+                    pickle.dump(all_ground_truths, f)
+                
+                logging.info(f"=" * 80)
+                logging.info(f"[POST-PROCESSING] Merge complete!")
+                logging.info(f"  Total samples merged: {len(all_predictions)}")
+                logging.info(f"  Saved to:")
+                logging.info(f"    - {merged_pred_file}")
+                logging.info(f"    - {merged_true_file}")
+                logging.info(f"=" * 80)
+                
+                # Optionally, remove rank-specific files to save space
+                # Uncomment the following lines if you want to auto-cleanup
+                # for batch_idx in batch_indices:
+                #     for rank in ranks:
+                #         pred_file = pred_dir / f"{self.name}_rank_{rank}_pred_{batch_idx}.pkl"
+                #         true_file = pred_dir / f"{self.name}_rank_{rank}_true_{batch_idx}.pkl"
+                #         if pred_file.exists():
+                #             pred_file.unlink()
+                #         if true_file.exists():
+                #             true_file.unlink()
+                # logging.info("  Cleaned up rank-specific files")
+                
+            except Exception as e:
+                logging.error(f"Failed to save merged predictions: {e}")
+        else:
+            logging.warning("No predictions to merge!")
+    
+    def _merge_distributed_caches(self):
+        """
+        Merge verifier caches from all GPU ranks into unified cache files.
+        
+        This function should only be called on rank 0 after all ranks have finished
+        their inference. It collects all rank-specific cache files and merges them
+        to avoid redundant computation in future runs.
+        
+        Output files:
+            - cache/mcts/spectra_cache_merged.pkl (for IcebergVerifier)
+            - cache/mcts/scores_cache_merged.pkl (for IcebergVerifier)
+            - cache/mcts/graff_spectra_cache_merged.pkl (for GraffMSVerifier)
+            - cache/mcts/graff_scores_cache_merged.pkl (for GraffMSVerifier)
+        """
+        import glob
+        from pathlib import Path
+        
+        # Determine cache directory from config
+        cache_dir = Path(getattr(self.cfg.mcts, 'cache_dir', './cache/mcts/'))
+        if not cache_dir.exists():
+            logging.warning(f"Cache directory does not exist: {cache_dir}")
+            return
+        
+        # Determine verifier type
+        verifier_type = getattr(self.cfg.mcts, 'verifier_type', 'iceberg')
+        
+        if verifier_type == 'iceberg':
+            spectra_pattern = 'spectra_cache_rank*.pkl'
+            scores_pattern = 'scores_cache_rank*.pkl'
+            merged_spectra_name = 'spectra_cache_merged.pkl'
+            merged_scores_name = 'scores_cache_merged.pkl'
+        elif verifier_type == 'graffms':
+            spectra_pattern = 'graff_spectra_cache_rank*.pkl'
+            scores_pattern = 'graff_scores_cache_rank*.pkl'
+            merged_spectra_name = 'graff_spectra_cache_merged.pkl'
+            merged_scores_name = 'graff_scores_cache_merged.pkl'
+        else:
+            logging.warning(f"Unknown verifier type: {verifier_type}, skipping cache merge")
+            return
+        
+        logging.info(f"=" * 80)
+        logging.info(f"[CACHE MERGE] Merging {verifier_type} caches from all ranks")
+        logging.info(f"=" * 80)
+        
+        # Find all rank-specific cache files
+        spectra_files = sorted(glob.glob(str(cache_dir / spectra_pattern)))
+        scores_files = sorted(glob.glob(str(cache_dir / scores_pattern)))
+        
+        if not spectra_files and not scores_files:
+            logging.info("No rank-specific cache files found to merge")
+            return
+        
+        logging.info(f"  Found {len(spectra_files)} spectra cache files")
+        logging.info(f"  Found {len(scores_files)} scores cache files")
+        
+        # Merge spectra caches
+        merged_spectra = {}
+        for file_path in spectra_files:
+            try:
+                with open(file_path, 'rb') as f:
+                    rank_cache = pickle.load(f)
+                # Update with rank cache (later ranks overwrite earlier ones if duplicate keys)
+                merged_spectra.update(rank_cache)
+                logging.info(f"  Loaded {len(rank_cache)} entries from {Path(file_path).name}")
+            except Exception as e:
+                logging.warning(f"Failed to load {file_path}: {e}")
+        
+        # Merge scores caches
+        merged_scores = {}
+        for file_path in scores_files:
+            try:
+                with open(file_path, 'rb') as f:
+                    rank_cache = pickle.load(f)
+                merged_scores.update(rank_cache)
+                logging.info(f"  Loaded {len(rank_cache)} entries from {Path(file_path).name}")
+            except Exception as e:
+                logging.warning(f"Failed to load {file_path}: {e}")
+        
+        # Save merged caches
+        if merged_spectra:
+            merged_spectra_path = cache_dir / merged_spectra_name
+            try:
+                with open(merged_spectra_path, 'wb') as f:
+                    pickle.dump(merged_spectra, f, protocol=4)
+                logging.info(f"  Saved merged spectra cache: {len(merged_spectra)} entries -> {merged_spectra_path}")
+            except Exception as e:
+                logging.error(f"Failed to save merged spectra cache: {e}")
+        
+        if merged_scores:
+            merged_scores_path = cache_dir / merged_scores_name
+            try:
+                with open(merged_scores_path, 'wb') as f:
+                    pickle.dump(merged_scores, f, protocol=4)
+                logging.info(f"  Saved merged scores cache: {len(merged_scores)} entries -> {merged_scores_path}")
+            except Exception as e:
+                logging.error(f"Failed to save merged scores cache: {e}")
+        
+        logging.info(f"=" * 80)
+        logging.info(f"[CACHE MERGE] Complete!")
+        logging.info(f"  Total unique spectra cached: {len(merged_spectra)}")
+        logging.info(f"  Total unique scores cached: {len(merged_scores)}")
+        logging.info(f"=" * 80)

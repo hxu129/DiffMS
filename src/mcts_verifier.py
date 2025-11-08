@@ -315,7 +315,8 @@ class IcebergVerifier(BaseVerifier):
                  bins_upper_mz: float = 1500.0,
                  bins_count: int = 15000,
                  num_workers: int = 8,
-                 cache_dir: str = './cache/mcts/'):
+                 cache_dir: str = './cache/mcts/',
+                 ddp_rank: int = 0):
         from ms_pred.dag_pred import joint_model as iceberg_joint
         from matchms.similarity import CosineGreedy
         import os
@@ -323,18 +324,62 @@ class IcebergVerifier(BaseVerifier):
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         self.num_workers = num_workers
         self.cache_dir = cache_dir
+        self.ddp_rank = ddp_rank
         
         # Create cache directory if it doesn't exist
         os.makedirs(cache_dir, exist_ok=True)
         
-        # Define cache file paths
-        self.spectra_cache_path = os.path.join(cache_dir, 'spectra_cache.pkl')
-        self.scores_cache_path = os.path.join(cache_dir, 'scores_cache.pkl')
+        # Define rank-specific cache file paths to avoid conflicts in distributed training
+        self.spectra_cache_path = os.path.join(cache_dir, f'spectra_cache_rank{ddp_rank}.pkl')
+        self.scores_cache_path = os.path.join(cache_dir, f'scores_cache_rank{ddp_rank}.pkl')
         
-        # Load persistent caches from disk
-        self.spectra_cache = self._load_cache(self.spectra_cache_path)
-        self.scores_cache = self._load_cache(self.scores_cache_path)
-        logging.info(f"Loaded persistent caches: {len(self.spectra_cache)} spectra, {len(self.scores_cache)} scores")
+        # Initialize empty caches
+        self.spectra_cache = {}
+        self.scores_cache = {}
+        
+        # UNIFIED CACHE LOADING: Load ALL available caches so all ranks have the same data
+        # This ensures cache consistency across ranks and better cache hit rates
+        
+        # 1. Load merged cache from previous runs (if exists)
+        merged_spectra_path = os.path.join(cache_dir, 'spectra_cache_merged.pkl')
+        merged_scores_path = os.path.join(cache_dir, 'scores_cache_merged.pkl')
+        
+        if os.path.exists(merged_spectra_path):
+            merged_spectra = self._load_cache(merged_spectra_path)
+            self.spectra_cache.update(merged_spectra)
+            logging.info(f"[Rank {ddp_rank}] Loaded {len(merged_spectra)} entries from merged spectra cache")
+        
+        if os.path.exists(merged_scores_path):
+            merged_scores = self._load_cache(merged_scores_path)
+            self.scores_cache.update(merged_scores)
+            logging.info(f"[Rank {ddp_rank}] Loaded {len(merged_scores)} entries from merged scores cache")
+        
+        # 2. Load ALL rank-specific caches (not just current rank)
+        # Discover all existing rank cache files
+        import glob
+        spectra_rank_files = glob.glob(os.path.join(cache_dir, 'spectra_cache_rank*.pkl'))
+        scores_rank_files = glob.glob(os.path.join(cache_dir, 'scores_cache_rank*.pkl'))
+        
+        total_loaded_spectra = len(self.spectra_cache)
+        total_loaded_scores = len(self.scores_cache)
+        
+        for rank_file in sorted(spectra_rank_files):
+            rank_cache = self._load_cache(rank_file)
+            self.spectra_cache.update(rank_cache)
+            logging.info(f"[Rank {ddp_rank}] Loaded {len(rank_cache)} entries from {os.path.basename(rank_file)}")
+        
+        for rank_file in sorted(scores_rank_files):
+            rank_cache = self._load_cache(rank_file)
+            self.scores_cache.update(rank_cache)
+            logging.info(f"[Rank {ddp_rank}] Loaded {len(rank_cache)} entries from {os.path.basename(rank_file)}")
+        
+        # Log total unique entries after loading all caches
+        new_spectra = len(self.spectra_cache) - total_loaded_spectra
+        new_scores = len(self.scores_cache) - total_loaded_scores
+        if new_spectra > 0 or new_scores > 0:
+            logging.info(f"[Rank {ddp_rank}] Added {new_spectra} unique spectra, {new_scores} unique scores from rank-specific caches")
+        
+        logging.info(f"[Rank {ddp_rank}] Total loaded caches: {len(self.spectra_cache)} spectra, {len(self.scores_cache)} scores")
         
         # Initialize batch counter for periodic saves
         self.batch_counter = 0
@@ -510,7 +555,8 @@ class GraffMSVerifier(BaseVerifier):
                  bins_count: int = 15000,
                  inference_batch_size: int = 32,
                  use_multi_gpu: bool = False,
-                 cache_dir: str = './cache/mcts/'):
+                 cache_dir: str = './cache/mcts/',
+                 ddp_rank: int = 0):
         """
         GPU-batched GraffMS verifier - optimized for speed with persistent caching.
         
@@ -523,6 +569,7 @@ class GraffMSVerifier(BaseVerifier):
             inference_batch_size: Batch size for GPU inference (default 32)
             use_multi_gpu: If True, use DataParallel for multi-GPU (default False)
             cache_dir: Directory for persistent caching
+            ddp_rank: DDP rank for distributed training (default 0)
         """
         from matchms.similarity import CosineGreedy
         import os
@@ -533,18 +580,62 @@ class GraffMSVerifier(BaseVerifier):
         self.bins_upper_mz = float(bins_upper_mz)
         self.bins_count = int(bins_count)
         self.cache_dir = cache_dir
+        self.ddp_rank = ddp_rank
         
         # Create cache directory if it doesn't exist
         os.makedirs(cache_dir, exist_ok=True)
         
-        # Define cache file paths
-        self.spectra_cache_path = os.path.join(cache_dir, 'graff_spectra_cache.pkl')
-        self.scores_cache_path = os.path.join(cache_dir, 'graff_scores_cache.pkl')
+        # Define rank-specific cache file paths to avoid conflicts in distributed training
+        self.spectra_cache_path = os.path.join(cache_dir, f'spectra_cache_rank{ddp_rank}.pkl')
+        self.scores_cache_path = os.path.join(cache_dir, f'scores_cache_rank{ddp_rank}.pkl')
         
-        # Load persistent caches from disk
-        self.spectra_cache = self._load_cache(self.spectra_cache_path)
-        self.scores_cache = self._load_cache(self.scores_cache_path)
-        logging.info(f"Loaded persistent caches: {len(self.spectra_cache)} spectra, {len(self.scores_cache)} scores")
+        # Initialize empty caches
+        self.spectra_cache = {}
+        self.scores_cache = {}
+        
+        # UNIFIED CACHE LOADING: Load ALL available caches so all ranks have the same data
+        # This ensures cache consistency across ranks and better cache hit rates
+        
+        # 1. Load merged cache from previous runs (if exists)
+        merged_spectra_path = os.path.join(cache_dir, 'spectra_cache_merged.pkl')
+        merged_scores_path = os.path.join(cache_dir, 'scores_cache_merged.pkl')
+        
+        if os.path.exists(merged_spectra_path):
+            merged_spectra = self._load_cache(merged_spectra_path)
+            self.spectra_cache.update(merged_spectra)
+            logging.info(f"[Rank {ddp_rank}] Loaded {len(merged_spectra)} entries from merged GraffMS spectra cache")
+        
+        if os.path.exists(merged_scores_path):
+            merged_scores = self._load_cache(merged_scores_path)
+            self.scores_cache.update(merged_scores)
+            logging.info(f"[Rank {ddp_rank}] Loaded {len(merged_scores)} entries from merged GraffMS scores cache")
+        
+        # 2. Load ALL rank-specific caches (not just current rank)
+        # Discover all existing rank cache files
+        import glob
+        spectra_rank_files = glob.glob(os.path.join(cache_dir, 'spectra_cache_rank*.pkl'))
+        scores_rank_files = glob.glob(os.path.join(cache_dir, 'scores_cache_rank*.pkl'))
+        
+        total_loaded_spectra = len(self.spectra_cache)
+        total_loaded_scores = len(self.scores_cache)
+        
+        for rank_file in sorted(spectra_rank_files):
+            rank_cache = self._load_cache(rank_file)
+            self.spectra_cache.update(rank_cache)
+            logging.info(f"[Rank {ddp_rank}] Loaded {len(rank_cache)} entries from {os.path.basename(rank_file)}")
+        
+        for rank_file in sorted(scores_rank_files):
+            rank_cache = self._load_cache(rank_file)
+            self.scores_cache.update(rank_cache)
+            logging.info(f"[Rank {ddp_rank}] Loaded {len(rank_cache)} entries from {os.path.basename(rank_file)}")
+        
+        # Log total unique entries after loading all caches
+        new_spectra = len(self.spectra_cache) - total_loaded_spectra
+        new_scores = len(self.scores_cache) - total_loaded_scores
+        if new_spectra > 0 or new_scores > 0:
+            logging.info(f"[Rank {ddp_rank}] Added {new_spectra} unique spectra, {new_scores} unique scores from rank-specific caches")
+        
+        logging.info(f"[Rank {ddp_rank}] Total loaded GraffMS caches: {len(self.spectra_cache)} spectra, {len(self.scores_cache)} scores")
         
         # Initialize batch counter for periodic saves
         self.batch_counter = 0
@@ -786,10 +877,14 @@ class GraffMSVerifier(BaseVerifier):
         
         return scores
 
-def build_verifier(cfg) -> BaseVerifier:
+def build_verifier(cfg, ddp_rank: int = 0) -> BaseVerifier:
     """Factory to build a verifier based on cfg.mcts.verifier_type.
 
     Supported types: 'iceberg' (default), 'graffms'.
+    
+    Args:
+        cfg: Configuration object
+        ddp_rank: DDP rank for distributed training (default 0)
     
     Required cfg for iceberg:
       - cfg.mcts.iceberg.gen_checkpoint
@@ -823,6 +918,7 @@ def build_verifier(cfg) -> BaseVerifier:
             bins_count=count,
             num_workers=num_workers,
             cache_dir=cache_dir,
+            ddp_rank=ddp_rank,
         )
     elif vt == 'graffms':
         mcts = cfg.mcts
@@ -840,6 +936,7 @@ def build_verifier(cfg) -> BaseVerifier:
             inference_batch_size=inference_batch_size,
             use_multi_gpu=use_multi_gpu,
             cache_dir=cache_dir,
+            ddp_rank=ddp_rank,
         )
     else:
         raise ValueError(f"Unsupported verifier_type: {vt}")
