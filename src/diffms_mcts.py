@@ -140,6 +140,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         self.T = cfg.model.diffusion_steps
         self.val_num_samples = cfg.general.val_samples_to_generate
         self.test_num_samples = cfg.general.test_samples_to_generate
+        self.eval_full_mol = cfg.mcts.eval_full_mol
 
         self.Xdim = input_dims['X']
         self.Edim = input_dims['E']
@@ -616,17 +617,20 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
     def _terminal_check_and_smiles(self, X_0: torch.Tensor, E_0: torch.Tensor) -> Tuple[bool, Optional[str], Optional[Chem.Mol]]:
 
         mol = self.visualization_tools.mol_from_graphs(X_0, E_0)
-        # Get the fragment with highest molecular weights (using atom count as proxy)
-        fragments = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False)
-        if not fragments:
-            return False, None, None
-    
-        max_weight_fragment = max(fragments, key=lambda x: x.GetNumAtoms())
-        try:
-            smi = Chem.MolToSmiles(max_weight_fragment)
-            return True, smi, max_weight_fragment
-        except:
-            return False, None, None
+        smi = Chem.MolToSmiles(mol)
+        if self.eval_full_mol:
+            return (False, None, None) if smi is None else (True, smi, mol)
+        else:
+            # Get the fragment with highest molecular weights (using atom count as proxy)
+            fragments = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False)
+            if not fragments:
+                return False, None, None
+            max_weight_fragment = max(fragments, key=lambda x: x.GetNumAtoms())
+            try:
+                smi = Chem.MolToSmiles(max_weight_fragment)
+                return True, smi, max_weight_fragment
+            except:
+                return False, None, None
 
     @torch.no_grad()
     def mcts_sample_batch(self, data: Batch, env_metas: List[dict], spectra: List[np.ndarray]) -> List[List[Tuple[str, float, Chem.Mol]]]:
