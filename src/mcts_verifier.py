@@ -598,7 +598,7 @@ class GraffMSVerifier(BaseVerifier):
             try:
                 from lmdb_cache import LMDBCache
                 # Use cache_dir directly as LMDB path
-                self.lmdb_cache = LMDBCache(cache_dir, map_size=40 * 1024**3)  # 40GB max
+                self.lmdb_cache = LMDBCache(cache_dir, map_size=60 * 1024**3)  # 60GB max (increased from 40GB)
                 logging.info(f"[Rank {ddp_rank}] Using LMDB cache at {cache_dir}")
                 stats = self.lmdb_cache.get_stats()
                 logging.info(f"[Rank {ddp_rank}] LMDB cache loaded: {stats['spectra_count']} spectra")
@@ -928,7 +928,7 @@ class GraffMSVerifier(BaseVerifier):
                     
                     if self.use_lmdb:
                         self.lmdb_cache.put_spectrum(smi, adduct, p_spec)
-                        self.lmdb_cache.put_score(smi, adduct, target_hash, bin_size, score)
+                        # self.lmdb_cache.put_score(smi, adduct, target_hash, bin_size, score)
                     else:
                         score_cache_key = (smi, adduct, target_hash, bin_size)
                         spec_cache_key = (smi, adduct)
