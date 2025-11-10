@@ -171,7 +171,7 @@ def _worker_predict_and_score_spectrum(args):
     warnings.filterwarnings('ignore', category=DeprecationWarning)
 
     global _worker_joint_model
-    mol, smi, t_spec, adduct, device, bin_size, spec_cache_key, score_cache_key = args
+    mol, smi, t_spec, adduct, device, bin_size, spec_cache_key = args
 
     # stage 1: predict the spectrum
     try:
@@ -213,13 +213,13 @@ def _worker_predict_and_score_spectrum(args):
         logging.error(f"Worker error on scoring spectrum {smi}: {e}")
         score = 0.0
     
-    return (score, p_spec, spec_cache_key, score_cache_key)
+    return (score, p_spec, spec_cache_key)
 
 @torch.no_grad()
 def _worker_predict_and_score_spectrum_graff(args):
     """
     Worker function for GraffMS that performs the ENTIRE prediction pipeline
-    and returns (score, spectrum, spec_cache_key, score_cache_key).
+    and returns (score, spectrum, spec_cache_key).
     """
     # Suppress warnings in worker processes
     import warnings
@@ -237,7 +237,7 @@ def _worker_predict_and_score_spectrum_graff(args):
     warnings.filterwarnings('ignore', category=DeprecationWarning)
 
     global _worker_graff_model, _worker_graff_featurizer
-    mol, smi, t_spec, adduct, device, bin_size, spec_cache_key, score_cache_key = args
+    mol, smi, t_spec, adduct, device, bin_size, spec_cache_key = args
 
     # Stage 1: Predict the spectrum using GraffMS
     try:
@@ -288,7 +288,7 @@ def _worker_predict_and_score_spectrum_graff(args):
         logging.error(f"Worker error on scoring spectrum {smi}: {e}")
         score = 0.0
     
-    return (score, p_spec, spec_cache_key, score_cache_key)
+    return (score, p_spec, spec_cache_key)
 
 class BaseVerifier:
     """Abstract verifier interface.
@@ -383,7 +383,7 @@ class IcebergVerifier(BaseVerifier):
         
         # Initialize batch counter for periodic saves
         self.batch_counter = 0
-        self.save_every_n_batches = 50
+        self.save_every_n_batches = 1e10
         
         # Create persistent worker pool
         ctx = mp.get_context('spawn')
@@ -400,6 +400,10 @@ class IcebergVerifier(BaseVerifier):
         self.tolerance_da = float(tolerance_da)
         self.bins_upper_mz = float(bins_upper_mz)
         self.bins_count = int(bins_count)
+
+        # Define rank-specific cache file paths to avoid conflicts in distributed training
+        self.spectra_cache_path = os.path.join(cache_dir, f'spectra_cache_rank{ddp_rank*2}.pkl')
+        self.scores_cache_path = os.path.join(cache_dir, f'scores_cache_rank{ddp_rank*2}.pkl')
     
     def _load_cache(self, cache_path: str) -> dict:
         """Load cache from pickle file, return empty dict if not exists."""
@@ -556,7 +560,8 @@ class GraffMSVerifier(BaseVerifier):
                  inference_batch_size: int = 32,
                  use_multi_gpu: bool = False,
                  cache_dir: str = './cache/mcts/',
-                 ddp_rank: int = 0):
+                 ddp_rank: int = 0,
+                 use_lmdb: bool = False):
         """
         GPU-batched GraffMS verifier - optimized for speed with persistent caching.
         
@@ -570,6 +575,7 @@ class GraffMSVerifier(BaseVerifier):
             use_multi_gpu: If True, use DataParallel for multi-GPU (default False)
             cache_dir: Directory for persistent caching
             ddp_rank: DDP rank for distributed training (default 0)
+            use_lmdb: If True, use LMDB cache for memory-efficient multi-process sharing (default False)
         """
         from matchms.similarity import CosineGreedy
         import os
@@ -581,65 +587,90 @@ class GraffMSVerifier(BaseVerifier):
         self.bins_count = int(bins_count)
         self.cache_dir = cache_dir
         self.ddp_rank = ddp_rank
+        self.use_lmdb = use_lmdb
         
         # Create cache directory if it doesn't exist
         os.makedirs(cache_dir, exist_ok=True)
         
-        # Define rank-specific cache file paths to avoid conflicts in distributed training
-        self.spectra_cache_path = os.path.join(cache_dir, f'spectra_cache_rank{ddp_rank}.pkl')
-        self.scores_cache_path = os.path.join(cache_dir, f'scores_cache_rank{ddp_rank}.pkl')
+        # Initialize cache based on backend type
+        if use_lmdb:
+            # Use LMDB for memory-efficient multi-process cache sharing
+            try:
+                from lmdb_cache import LMDBCache
+                # Use cache_dir directly as LMDB path
+                self.lmdb_cache = LMDBCache(cache_dir, map_size=40 * 1024**3)  # 40GB max
+                logging.info(f"[Rank {ddp_rank}] Using LMDB cache at {cache_dir}")
+                stats = self.lmdb_cache.get_stats()
+                logging.info(f"[Rank {ddp_rank}] LMDB cache loaded: {stats['spectra_count']} spectra")
+                
+                # No need for pickle-based caches
+                self.spectra_cache = None
+                self.batch_counter = 0
+                self.save_every_n_batches = float('inf')  # LMDB auto-saves
+                
+            except ImportError:
+                logging.error("LMDB not installed but use_lmdb=True. Run: pip install lmdb")
+                logging.error("Falling back to pickle cache...")
+                use_lmdb = False
+                self.use_lmdb = False
         
-        # Initialize empty caches
-        self.spectra_cache = {}
-        self.scores_cache = {}
+        if not use_lmdb:
+            # Use original pickle-based cache
+            self.lmdb_cache = None
+            
+            # Define rank-specific cache file paths to avoid conflicts in distributed training
+            self.spectra_cache_path = os.path.join(cache_dir, f'spectra_cache_rank{ddp_rank}.pkl')
+            self.scores_cache_path = os.path.join(cache_dir, f'scores_cache_rank{ddp_rank}.pkl')
+
+            # Initialize empty caches
+            self.spectra_cache = {}
+            self.scores_cache = {}
+            # UNIFIED CACHE LOADING: Load ALL available caches so all ranks have the same data
+            # This ensures cache consistency across ranks and better cache hit rates
+            
+            # 1. Load merged cache from previous runs (if exists)
+            merged_spectra_path = os.path.join(cache_dir, 'spectra_cache_merged.pkl')
+            merged_scores_path = os.path.join(cache_dir, 'scores_cache_merged.pkl')
+
+            if os.path.exists(merged_spectra_path):
+                merged_spectra = self._load_cache(merged_spectra_path)
+                self.spectra_cache.update(merged_spectra)
+                logging.info(f"[Rank {ddp_rank}] Loaded {len(merged_spectra)} entries from merged GraffMS spectra cache")
+ 
+            if os.path.exists(merged_scores_path):
+                merged_scores = self._load_cache(merged_scores_path)
+                self.scores_cache.update(merged_scores)
+                logging.info(f"[Rank {ddp_rank}] Loaded {len(merged_scores)} entries from merged GraffMS scores cache")
+           
+            # 2. Load ALL rank-specific caches (not just current rank)
+            # Discover all existing rank cache files
+            import glob
+            spectra_rank_files = glob.glob(os.path.join(cache_dir, 'spectra_cache_rank*.pkl'))
+            scores_rank_files = glob.glob(os.path.join(cache_dir, 'scores_cache_rank*.pkl'))
+            total_loaded_spectra = len(self.spectra_cache)
+            total_loaded_scores = len(self.scores_cache)
+            
+            for rank_file in sorted(spectra_rank_files):
+                rank_cache = self._load_cache(rank_file)
+                self.spectra_cache.update(rank_cache)
+                logging.info(f"[Rank {ddp_rank}] Loaded {len(rank_cache)} entries from {os.path.basename(rank_file)}")
+            
+            for rank_file in sorted(scores_rank_files):
+                rank_cache = self._load_cache(rank_file)
+                self.scores_cache.update(rank_cache)
+                logging.info(f"[Rank {ddp_rank}] Loaded {len(rank_cache)} entries from {os.path.basename(rank_file)}")
+            
+            # Log total unique entries after loading all caches
+            new_spectra = len(self.spectra_cache) - total_loaded_spectra
+            new_scores = len(self.scores_cache) - total_loaded_scores
+            if new_spectra > 0 or new_scores > 0:
+                logging.info(f"[Rank {ddp_rank}] Added {new_spectra} unique spectra, {new_scores} unique scores from rank-specific caches")
         
-        # UNIFIED CACHE LOADING: Load ALL available caches so all ranks have the same data
-        # This ensures cache consistency across ranks and better cache hit rates
-        
-        # 1. Load merged cache from previous runs (if exists)
-        merged_spectra_path = os.path.join(cache_dir, 'spectra_cache_merged.pkl')
-        merged_scores_path = os.path.join(cache_dir, 'scores_cache_merged.pkl')
-        
-        if os.path.exists(merged_spectra_path):
-            merged_spectra = self._load_cache(merged_spectra_path)
-            self.spectra_cache.update(merged_spectra)
-            logging.info(f"[Rank {ddp_rank}] Loaded {len(merged_spectra)} entries from merged GraffMS spectra cache")
-        
-        if os.path.exists(merged_scores_path):
-            merged_scores = self._load_cache(merged_scores_path)
-            self.scores_cache.update(merged_scores)
-            logging.info(f"[Rank {ddp_rank}] Loaded {len(merged_scores)} entries from merged GraffMS scores cache")
-        
-        # 2. Load ALL rank-specific caches (not just current rank)
-        # Discover all existing rank cache files
-        import glob
-        spectra_rank_files = glob.glob(os.path.join(cache_dir, 'spectra_cache_rank*.pkl'))
-        scores_rank_files = glob.glob(os.path.join(cache_dir, 'scores_cache_rank*.pkl'))
-        
-        total_loaded_spectra = len(self.spectra_cache)
-        total_loaded_scores = len(self.scores_cache)
-        
-        for rank_file in sorted(spectra_rank_files):
-            rank_cache = self._load_cache(rank_file)
-            self.spectra_cache.update(rank_cache)
-            logging.info(f"[Rank {ddp_rank}] Loaded {len(rank_cache)} entries from {os.path.basename(rank_file)}")
-        
-        for rank_file in sorted(scores_rank_files):
-            rank_cache = self._load_cache(rank_file)
-            self.scores_cache.update(rank_cache)
-            logging.info(f"[Rank {ddp_rank}] Loaded {len(rank_cache)} entries from {os.path.basename(rank_file)}")
-        
-        # Log total unique entries after loading all caches
-        new_spectra = len(self.spectra_cache) - total_loaded_spectra
-        new_scores = len(self.scores_cache) - total_loaded_scores
-        if new_spectra > 0 or new_scores > 0:
-            logging.info(f"[Rank {ddp_rank}] Added {new_spectra} unique spectra, {new_scores} unique scores from rank-specific caches")
-        
-        logging.info(f"[Rank {ddp_rank}] Total loaded GraffMS caches: {len(self.spectra_cache)} spectra, {len(self.scores_cache)} scores")
-        
-        # Initialize batch counter for periodic saves
-        self.batch_counter = 0
-        self.save_every_n_batches = 50
+            logging.info(f"[Rank {ddp_rank}] Total loaded GraffMS caches: {len(self.spectra_cache)} spectra, {len(self.scores_cache)} scores")
+            
+            # Initialize batch counter for periodic saves
+            self.batch_counter = 0
+            self.save_every_n_batches = float('inf') # temp
         
         # Load model on GPU (NOT CPU workers!)
         from ms_pred.graff_ms import graff_ms_model
@@ -717,17 +748,23 @@ class GraffMSVerifier(BaseVerifier):
     
     def __del__(self):
         """Cleanup: save caches."""
-        if hasattr(self, 'spectra_cache') and hasattr(self, 'scores_cache'):
+        if self.use_lmdb and hasattr(self, 'lmdb_cache'):
+            # LMDB auto-saves, just close
+            self.lmdb_cache.close()
+        elif hasattr(self, 'spectra_cache') and hasattr(self, 'scores_cache'):
             logging.info("Saving caches before cleanup...")
             self._save_caches_to_disk()
     
     def get_cache_stats(self):
         """Get statistics about the persistent cache."""
-        return {
-            'spectra_cache_size': len(self.spectra_cache),
-            'scores_cache_size': len(self.scores_cache),
-            'cache_dir': self.cache_dir
-        }
+        if self.use_lmdb:
+            return self.lmdb_cache.get_stats()
+        else:
+            return {
+                'spectra_cache_size': len(self.spectra_cache),
+                'scores_cache_size': len(self.scores_cache),
+                'cache_dir': self.cache_dir
+            }
     
 
     @torch.no_grad()
@@ -761,31 +798,57 @@ class GraffMSVerifier(BaseVerifier):
         
         for i, (mol, smi, adduct, t_spec) in enumerate(zip(mol_list, smiles_list, adducts, target_spectra_list)):
             # Create cache keys
-            spec_cache_key = (smi, adduct)
             target_hash = sha256(t_spec.tobytes()).hexdigest()
-            score_cache_key = (smi, adduct, target_hash, bin_size)
             
-            # Check if score is already cached
-            if score_cache_key in self.scores_cache:
-                scores[i] = self.scores_cache[score_cache_key]
-                cache_hits_score += 1
-                continue
-            
-            # Score not cached - check if spectrum is cached (partial hit)
-            if spec_cache_key in self.spectra_cache:
-                # Spectrum cached, only need to score it
-                p_spec = self.spectra_cache[spec_cache_key]
-                try:
-                    score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, 
-                                                     bin_size=bin_size, mz_max=self.bins_upper_mz)
-                except Exception as e:
-                    logging.error(f"Scoring error for {smi}: {e}")
-                    score = 0.0
+            if self.use_lmdb:
+                # Check score cache first (full hit)
+                cached_score = self.lmdb_cache.get_score(smi, adduct, target_hash, bin_size)
+                if cached_score is not None:
+                    scores[i] = cached_score
+                    cache_hits_score += 1
+                    continue
                 
-                scores[i] = score
-                self.scores_cache[score_cache_key] = score
-                cache_hits_spec += 1
-                continue
+                # Check spectrum cache (partial hit)
+                p_spec = self.lmdb_cache.get_spectrum(smi, adduct)
+                if p_spec is not None:
+                    try:
+                        score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, 
+                                                         bin_size=bin_size, mz_max=self.bins_upper_mz)
+                        scores[i] = score
+                        # Save the computed score
+                        # Dont save the score to the LMDB cache to save space
+                        # self.lmdb_cache.put_score(smi, adduct, target_hash, bin_size, score)
+                        cache_hits_spec += 1
+                        continue
+                    except Exception as e:
+                        logging.error(f"Scoring error for {smi}: {e}")
+            else:
+                # Pickle cache lookup
+                spec_cache_key = (smi, adduct)
+                score_cache_key = (smi, adduct, target_hash, bin_size)
+                
+                # Check score cache first (full hit)
+                if score_cache_key in self.scores_cache:
+                    scores[i] = self.scores_cache[score_cache_key]
+                    cache_hits_score += 1
+                    continue
+                
+                # Check spectrum cache (partial hit)
+                if spec_cache_key in self.spectra_cache:
+                    # Spectrum cached, only need to score it
+                    p_spec = self.spectra_cache[spec_cache_key]
+                    try:
+                        score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, 
+                                                         bin_size=bin_size, mz_max=self.bins_upper_mz)
+                    except Exception as e:
+                        logging.error(f"Scoring error for {smi}: {e}")
+                        score = 0.0
+                    
+                    scores[i] = score
+                    # Save the computed score
+                    self.scores_cache[score_cache_key] = score
+                    cache_hits_spec += 1
+                    continue
             
             # Neither spectrum nor score cached - need full computation
             cache_misses += 1
@@ -860,24 +923,32 @@ class GraffMSVerifier(BaseVerifier):
                     scores[orig_idx] = score
                     
                     # Update caches
-                    spec_cache_key = (smi, adduct)
+                    # Compute target hash for this specific target spectrum
                     target_hash = sha256(t_spec.tobytes()).hexdigest()
-                    score_cache_key = (smi, adduct, target_hash, bin_size)
-                    self.spectra_cache[spec_cache_key] = p_spec
-                    self.scores_cache[score_cache_key] = score
+                    
+                    if self.use_lmdb:
+                        self.lmdb_cache.put_spectrum(smi, adduct, p_spec)
+                        self.lmdb_cache.put_score(smi, adduct, target_hash, bin_size, score)
+                    else:
+                        score_cache_key = (smi, adduct, target_hash, bin_size)
+                        spec_cache_key = (smi, adduct)
+                        self.spectra_cache[spec_cache_key] = p_spec
+                        self.scores_cache[score_cache_key] = score
             
             logging.info(f"GPU computed {len(uncached_mols)} items in {time.time() - current_time:.2f}s")
         
-        # Phase 3: Periodic save to disk
-        self.batch_counter += 1
-        if self.batch_counter >= self.save_every_n_batches:
-            logging.info(f"Periodic cache save triggered (batch {self.batch_counter})")
-            self._save_caches_to_disk()
-            self.batch_counter = 0
+        # Phase 3: Periodic save to disk (only for pickle cache)
+        if not self.use_lmdb:
+            self.batch_counter += 1
+            if self.batch_counter >= self.save_every_n_batches:
+                logging.info(f"Periodic cache save triggered (batch {self.batch_counter})")
+                self._save_caches_to_disk()
+                self.batch_counter = 0
+        # LMDB auto-saves, no manual save needed
         
         return scores
 
-def build_verifier(cfg, ddp_rank: int = 0) -> BaseVerifier:
+def build_verifier(cfg, ddp_rank: int = 0, use_lmdb: bool = None) -> BaseVerifier:
     """Factory to build a verifier based on cfg.mcts.verifier_type.
 
     Supported types: 'iceberg' (default), 'graffms'.
@@ -885,6 +956,7 @@ def build_verifier(cfg, ddp_rank: int = 0) -> BaseVerifier:
     Args:
         cfg: Configuration object
         ddp_rank: DDP rank for distributed training (default 0)
+        use_lmdb: Whether to use LMDB cache (default: read from cfg.mcts.use_lmdb_cache)
     
     Required cfg for iceberg:
       - cfg.mcts.iceberg.gen_checkpoint
@@ -902,6 +974,10 @@ def build_verifier(cfg, ddp_rank: int = 0) -> BaseVerifier:
       - optional: cfg.mcts.num_workers (int, default 8)
       - optional: cfg.mcts.cache_dir (str, default './cache/mcts/')
     """
+    # Determine whether to use LMDB cache
+    if use_lmdb is None:
+        use_lmdb = getattr(cfg.mcts, 'use_lmdb_cache', False)
+    
     vt = getattr(cfg.mcts, 'verifier_type', 'iceberg')
     if vt == 'iceberg':
         mcts = cfg.mcts
@@ -937,6 +1013,7 @@ def build_verifier(cfg, ddp_rank: int = 0) -> BaseVerifier:
             use_multi_gpu=use_multi_gpu,
             cache_dir=cache_dir,
             ddp_rank=ddp_rank,
+            use_lmdb=use_lmdb,
         )
     else:
         raise ValueError(f"Unsupported verifier_type: {vt}")
