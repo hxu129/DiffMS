@@ -297,6 +297,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         nll = self.compute_val_loss(pred, noisy_data, dense_data.X, dense_data.E, data.y,  node_mask, test=False)
 
+        if self.global_rank == 0:
+            logging.info(f"Batch {i}: Generating {self.val_num_samples} molecules for {len(data)} samples...")
+
         true_E = torch.reshape(dense_data.E, (-1, dense_data.E.size(-1)))  # (bs * n * n, de)
         masked_pred_E = torch.reshape(pred.E, (-1, pred.E.size(-1)))   # (bs * n * n, de)
         mask_E = (true_E != 0.).any(dim=-1)
