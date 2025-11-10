@@ -68,6 +68,13 @@ def get_paired_spectra(
         )
         spectra_files = [Path(f"{i}.ms") for i in name_to_formula]
 
+    import pathlib, os
+
+    input_filename = "/local3/ericjiang/wgc/huaxu/ms/DiffMS/data/spectra_file_list.txt"
+    if os.path.exists(input_filename):
+        with open(input_filename, 'r') as f:
+            spectra_files = [pathlib.Path(line.strip()) for line in f]
+
     if max_count is not None:
         print(max_count)
         print(type(max_count))
