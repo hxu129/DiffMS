@@ -1,12 +1,12 @@
-CUDA_VISIBLE_DEVICES=0 python src/spec2mol_main.py \
+CUDA_VISIBLE_DEVICES=1,2,3 python src/spec2mol_main.py \
     train.eval_batch_size=128 \
     general.wandb_name=test \
     general.validate_only=/local3/ericjiang/wgc/huaxu/ms/DiffMS/checkpoints/diffms_canopus.ckpt \
-    general.name=baseline-validate-hyper-compare \
+    general.name=baseline-validate-100 \
     general.sample_every_val=100 \
-    general.test_samples_to_generate=1000 \
-    general.val_samples_to_generate=10 \
-    general.gpus=1 \
+    general.test_samples_to_generate=100 \
+    general.val_samples_to_generate=100 \
+    general.gpus=3 \
     general.seed=123 \
     mcts.use_mcts=false \
     dataset.max_count=3000 \
