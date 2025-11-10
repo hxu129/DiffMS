@@ -10,6 +10,7 @@ prediffuse_steps: 10
 # Tracks: tree size, visit counts, reward distribution, Q-values, diversity
 # Warning: Increases memory usage and log file size
 debug_logging: false
+use_lmdb_cache: false
 
 verifier_type: 'iceberg'
 
@@ -31,6 +32,14 @@ num_workers: 16
 
 expand_steps: 10
 
-cache_dir: '/local3/ericjiang/wgc/huaxu/ms/DiffMS/cache/graffms/'
+cache_dir: '/local3/ericjiang/wgc/huaxu/ms/DiffMS/cache/graffms_lmdb/'
 
 eval_full_mol: false
+
+# Temperature sampling for diversity in MCTS children
+# If use_temperature=false, all children use temperature=1.0 (no diversity boost)
+# If use_temperature=true, must specify temperature_values as a list of length branch_k
+# Lower temperature (< 1.0) = more deterministic (exploitation)
+# Higher temperature (> 1.0) = more random (exploration)
+use_temperature: false
+temperature_values: [1.0, 1.0, 1.0, 1.0, 1.0]  # Must match branch_k length

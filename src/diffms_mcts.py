@@ -293,16 +293,44 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         mcts = getattr(self.cfg, 'mcts', None)
         def _get(name, default):
             return getattr(mcts, name, default) if mcts is not None else default
+        
+        branch_k = _get('branch_k', 6)
+        use_temperature = _get('use_temperature', False)
+        temperature_values = _get('temperature_values', None)
+        
+        # Process temperature values
+        if not use_temperature:
+            # If temperature is disabled, use 1.0 for all branches
+            temperature_values = [1.0] * branch_k
+        else:
+            # Temperature is enabled - must be specified
+            if temperature_values is None:
+                raise ValueError(
+                    f"use_temperature=True but temperature_values not specified. "
+                    f"Please provide a list of {branch_k} temperature values."
+                )
+            # Convert to list if needed
+            if not isinstance(temperature_values, list):
+                temperature_values = list(temperature_values)
+            # Validate length
+            if len(temperature_values) != branch_k:
+                raise ValueError(
+                    f"Temperature values length ({len(temperature_values)}) must match branch_k ({branch_k})"
+                )
+        
         self.mcts_config = {
             'use_mcts': _get('use_mcts', False),
             'num_simulation_steps': _get('num_simulation_steps', _get('num_sumulation_steps', 400)),
-            'branch_k': _get('branch_k', 6),
+            'branch_k': branch_k,
             'c_puct': _get('c_puct', _get('c_uct', 1.0)),
             'time_budget_s': _get('time_budget_s', 0.0),
             'verifier_batch_size': _get('verifier_batch_size', 32),
             'expand_steps': _get('expand_steps', 1),  # Number of denoising steps during expansion
             'prediffuse_steps': _get('prediffuse_steps', 10),
             'debug_logging': _get('debug_logging', False),  # Enable detailed debug logging
+            # Temperature sampling for diversity
+            'use_temperature': use_temperature,
+            'temperature_values': temperature_values,  # List of K temperature values
         }
         # External verifier should be injected; we only call verifier.score()
         self.verifier = getattr(self, 'verifier', None)
@@ -942,7 +970,8 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                     t_arr = (t_int_per_node.float() / self.T).unsqueeze(1)  # [chunk_size, 1]
                     
                     # Batched denoising: ALL nodes in chunk denoised together with their individual timesteps
-                    sampled_s, _ = self.sample_p_zs_given_zt(s_arr, t_arr, X_all, E_all, y_all, mask_all)
+                    # Use temperature=1.0 (standard sampling, no diversity needed when completing nodes)
+                    sampled_s, _ = self.sample_p_zs_given_zt(s_arr, t_arr, X_all, E_all, y_all, mask_all, temperature=1.0)
                     
                     # Update ONLY active nodes using the mask
                     # For inactive nodes (already at t=0), keep their current state
@@ -1020,9 +1049,19 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         
         return results
 
-    def sample_p_zs_given_zt(self, s, t, X_t, E_t, y_t, node_mask):
+    def sample_p_zs_given_zt(self, s, t, X_t, E_t, y_t, node_mask, temperature=1.0):
         """Samples from zs ~ p(zs | zt). Only used during sampling.
-           if last_step, return the graph prediction as well"""
+           if last_step, return the graph prediction as well
+           
+           Args:
+               s, t: Normalized timesteps [bs, 1]
+               X_t, E_t, y_t: Current noisy states
+               node_mask: Node mask [bs, n_atoms]
+               temperature: Temperature for sampling diversity
+                   - float: single temperature for all samples (default 1.0)
+                   - torch.Tensor [bs]: per-sample temperature values
+                       Used in MCTS expand to create diverse children
+        """
         bs, n, dxs = X_t.shape
         beta_t = self.noise_schedule(t_normalized=t)  # (bs, 1)
         alpha_s_bar = self.noise_schedule.get_alpha_bar(t_normalized=s)
@@ -1038,9 +1077,17 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         extra_data = self.compute_extra_data(noisy_data)
         pred = self.forward(noisy_data, extra_data, node_mask)
 
-        # Normalize predictions
-        pred_X = F.softmax(pred.X, dim=-1)               # bs, n, d0
-        pred_E = F.softmax(pred.E, dim=-1)               # bs, n, n, d0
+        # Apply temperature scaling before softmax
+        if isinstance(temperature, torch.Tensor):
+            # Per-sample temperature for MCTS diversity: [bs] -> [bs, 1, 1] for X, [bs, 1, 1, 1] for E
+            temp_X = temperature.view(bs, 1, 1)
+            temp_E = temperature.view(bs, 1, 1, 1)
+            pred_X = F.softmax(pred.X / temp_X, dim=-1)  # bs, n, d0
+            pred_E = F.softmax(pred.E / temp_E, dim=-1)  # bs, n, n, d0
+        else:
+            # Single temperature (usually 1.0 for standard sampling)
+            pred_X = F.softmax(pred.X / temperature, dim=-1)  # bs, n, d0
+            pred_E = F.softmax(pred.E / temperature, dim=-1)  # bs, n, n, d0
 
         p_s_and_t_given_0_X = diffusion_utils.compute_batched_over0_posterior_distribution(X_t=X_t,
                                                                                            Qt=Qt.X,
@@ -1108,11 +1155,12 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         - Root children visit counts (exploration balance)
         - Reward distribution (sparsity analysis) - ONLY for newly evaluated nodes in this step
         - Q-values of top nodes
+        - Terminal node information
         """
         device = tree.node_visits.device
         
         # Focus on first sample for detailed logging (to avoid clutter)
-        sample_idx = 0
+        sample_idx = 2
         
         # 1. Tree size
         tree_size = tree.num_nodes[sample_idx].item()
@@ -1129,14 +1177,40 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         self.debug_metrics['root_children_visits'].append(root_children_visits.copy())
         
         # 3. Reward distribution - collect rewards ONLY from newly evaluated nodes in this step
+        # Also track terminal status, timesteps, and whether nodes are truly new
+        num_terminal_nodes = 0
+        num_reexpanded_nodes = 0
+        truly_new_node_indices = []
+        node_timesteps = []  # Track timesteps of expanded nodes
+        
         if newly_evaluated_nodes is not None:
             # newly_evaluated_nodes shape: [batch_size, K] - only look at sample 0
             new_node_indices = newly_evaluated_nodes[sample_idx].cpu().numpy()  # [K]
             # Get unique node indices (terminal nodes might be repeated)
             unique_new_nodes = np.unique(new_node_indices)
+            
             if len(unique_new_nodes) > 0:
                 # Convert to torch tensor for indexing
                 unique_new_nodes_tensor = torch.from_numpy(unique_new_nodes).to(device)
+                
+                # Check terminal status, visit counts, and timesteps for each node
+                for node_idx in unique_new_nodes_tensor:
+                    is_terminal = tree.is_terminal[sample_idx, node_idx].item()
+                    visit_count = tree.node_visits[sample_idx, node_idx].item()
+                    timestep_int = tree.node_timesteps_int[sample_idx, node_idx].item()
+                    
+                    node_timesteps.append(timestep_int)
+                    
+                    if is_terminal:
+                        num_terminal_nodes += 1
+                    
+                    # A node is "truly new" if it was just evaluated for the first time
+                    # For terminal nodes that are re-selected, visit_count > 1
+                    if visit_count == 1:
+                        truly_new_node_indices.append(node_idx.item())
+                    else:
+                        num_reexpanded_nodes += 1
+                
                 # Get rewards for these nodes
                 current_step_rewards = tree.node_rewards[sample_idx, unique_new_nodes_tensor]
                 # Filter out nodes with visit count = 0 (shouldn't happen, but safety check)
@@ -1193,10 +1267,48 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 if balance_ratio < 0.1:
                     logging.info(f"  ⚠️  WARNING: Highly imbalanced exploration! Consider increasing c_puct.")
             
+            # Log expansion information
+            if newly_evaluated_nodes is not None:
+                total_evaluated = len(unique_new_nodes) if 'unique_new_nodes' in locals() else 0
+                
+                # Calculate average timestep of expanded nodes
+                avg_timestep = np.mean(node_timesteps) if len(node_timesteps) > 0 else 0
+                min_timestep = min(node_timesteps) if len(node_timesteps) > 0 else 0
+                max_timestep = max(node_timesteps) if len(node_timesteps) > 0 else 0
+                
+                logging.info(f"  Expansion Info:")
+                logging.info(f"    - Total unique nodes processed: {total_evaluated}")
+                logging.info(f"    - Terminal nodes: {num_terminal_nodes}")
+                logging.info(f"    - Re-expanded nodes (visit_count > 1): {num_reexpanded_nodes}")
+                logging.info(f"    - Truly new nodes (visit_count = 1): {len(truly_new_node_indices)}")
+                logging.info(f"    - Timestep stats (t_int): avg={avg_timestep:.1f}, min={min_timestep}, max={max_timestep}")
+                logging.info(f"    - Normalized depth: {avg_timestep/self.T:.2%} of total diffusion steps")
+                
+                # Log temperature sampling configuration
+                temp_values = self.mcts_config['temperature_values']
+                logging.info(f"    - Temperature values: {[f'{t:.2f}' for t in temp_values]}")
+                
+                # Store in debug metrics for visualization
+                if not hasattr(self.debug_metrics, 'expansion_timesteps_history'):
+                    self.debug_metrics['expansion_timesteps_history'] = []
+                self.debug_metrics['expansion_timesteps_history'].append({
+                    'step': sim_step,
+                    'avg_timestep': avg_timestep,
+                    'min_timestep': min_timestep,
+                    'max_timestep': max_timestep,
+                    'timesteps': node_timesteps.copy()
+                })
+                
+                if num_terminal_nodes > 0:
+                    logging.info(f"  ⚠️  MCTS selected {num_terminal_nodes} terminal node(s) - these are already complete molecules!")
+                
+                if num_reexpanded_nodes > 0:
+                    logging.info(f"  ⚠️  MCTS re-expanded {num_reexpanded_nodes} previously visited node(s)")
+            
             # Log reward stats for newly evaluated nodes only
             if valid_rewards_for_stats.numel() > 0:
                 num_new_nodes = valid_rewards_for_stats.numel()
-                logging.info(f"  Reward Stats (Current Step - {num_new_nodes} newly evaluated nodes):")
+                logging.info(f"  Reward Stats (Current Step - {num_new_nodes} evaluated nodes):")
                 logging.info(f"    - Mean: {valid_rewards_for_stats.mean().item():.4f}")
                 logging.info(f"    - Std:  {valid_rewards_for_stats.std().item():.4f}")
                 logging.info(f"    - Min:  {valid_rewards_for_stats.min().item():.4f}")
@@ -1545,7 +1657,8 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             t_norm = t_array / self.T
             
             # Batched denoising: sample_p_zs_given_zt handles batch dimension
-            sampled_s, _ = self.sample_p_zs_given_zt(s_norm, t_norm, X_cur, E_cur, y_cur, mask_cur)
+            # Use temperature=1.0 (standard sampling, no diversity needed in prediffuse)
+            sampled_s, _ = self.sample_p_zs_given_zt(s_norm, t_norm, X_cur, E_cur, y_cur, mask_cur, temperature=1.0)
             # Update edges only (edge-only denoising)
             E_cur = sampled_s.E
         
@@ -1671,7 +1784,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             # Mask out invalid children (UNVISITED)
             # Shape: [batch_size, branch_k]
             is_invalid = children_indices == BatchedMctsTree.UNVISITED
-            uct_scores = torch.where(is_invalid, torch.tensor(float('inf'), device=device), uct_scores) # the inf does not matter
+            uct_scores = torch.where(is_invalid, torch.tensor(-1 * float('inf'), device=device), uct_scores) # the inf does not matter
             
             # Check if any sample has valid children to continue with
             has_valid_children = ~is_invalid.all(dim=1)  # [batch_size]
@@ -1771,6 +1884,22 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         # Get number of expansion steps from config
         expand_steps = self.mcts_config.get('expand_steps', 1)
         
+        # Prepare temperature values for diversity in MCTS expansion
+        # Get temperature values (always a list of length K, validated in _init_mcts_config)
+        temp_values = self.mcts_config['temperature_values']
+        
+        # Create [B*K] temperature tensor to match the interleaved batch structure
+        # The expanded states are created via repeat_interleave(K, dim=0), which gives:
+        #   [sample0_child0, sample0_child1, ..., sample0_childK-1, 
+        #    sample1_child0, sample1_child1, ..., sample1_childK-1, ...]
+        # We create matching temperature pattern:
+        #   [temp[0], temp[1], ..., temp[K-1], temp[0], temp[1], ..., temp[K-1], ...]
+        # This ensures child i always uses temp_values[i] for diversity
+        temp_list = []
+        for b in range(batch_size):
+            temp_list.extend(temp_values)  # Add all K temperatures for this sample
+        temperatures = torch.tensor(temp_list, device=device, dtype=torch.float32)  # [B*K]
+        
         # Track current timesteps for each sample
         current_t_int = expanded_t_int # [B*K]
         current_X = expanded_X # [B*K, n_atoms, X_dim]
@@ -1795,10 +1924,12 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             next_t_norm = (next_t_int.float() / self.T).unsqueeze(1)  # [B*K, 1]
             
             # Batched denoising: sample K children per sample in one forward pass
-            # sample_p_zs_given_zt handles batch dimension automatically
-            # Input: [B*K, ...], Output: [B*K, ...]
+            # Input: [B*K, ...] where batch contains interleaved children
+            # temperature: [B*K] tensor where each child gets its designated temperature
+            # This creates diversity: child 0 uses temp[0], child 1 uses temp[1], etc.
             sampled_states, _ = self.sample_p_zs_given_zt(
-                next_t_norm, next_leaf_t_norm, current_X, current_E, expanded_y, expanded_mask
+                next_t_norm, next_leaf_t_norm, current_X, current_E, expanded_y, expanded_mask,
+                temperature=temperatures
             )
             
             # Update ONLY active samples using the mask
@@ -1863,7 +1994,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         tree: BatchedMctsTree,
         node_indices: torch.Tensor,  # [batch_size] or [batch_size, K]
         env_metas: List[dict],
-        spectra: List[np.ndarray]
+        spectra: List[np.ndarray],
     ) -> torch.Tensor:
         """
         Evaluate nodes using batched ICEBERG forward passes.
