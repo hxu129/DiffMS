@@ -440,9 +440,16 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         """ Measure likelihood on a test set and compute stability metrics. """
+        logging.info(f"[Rank {self.global_rank}] Entering on_validation_epoch_end at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
         # Synchronize all processes before merging (ensure all ranks finished writing)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            logging.info(f"[Rank {self.global_rank}] Waiting at barrier for other ranks...")
+            try:
+                torch.distributed.barrier()
+                logging.info(f"[Rank {self.global_rank}] Barrier passed - all ranks synchronized")
+            except Exception as e:
+                logging.error(f"[Rank {self.global_rank}] Barrier failed: {e}")
         
         # Merge rank-specific prediction files and caches (only on rank 0)
         # if self.global_rank == 0:
@@ -467,6 +474,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             "val/E_CE": metrics[5]
         }
 
+        logging.info(f"[Rank {self.global_rank}] Logging validation metrics with sync_dist=True...")
         self.log_dict(log_dict, sync_dist=True)
         if self.global_rank == 0:
             logging.info(f"Epoch {self.current_epoch}: Test NLL {metrics[0] :.2f} -- Test Atom type KL {metrics[1] :.2f} -- Test Edge type KL: {metrics[2] :.2f} -- Test Edge type logp: {metrics[3] :.2f} -- Test Edge type CE: {metrics[5] :.2f}")
@@ -478,7 +486,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             log_dict[f"val/{key}"] = value
         log_dict["val/validity"] = self.val_validity.compute()
 
+        logging.info(f"[Rank {self.global_rank}] Logging final validation metrics with sync_dist=True...")
         self.log_dict(log_dict, sync_dist=True)
+        logging.info(f"[Rank {self.global_rank}] Completed on_validation_epoch_end")
 
     def on_test_epoch_start(self) -> None:
         if self.global_rank == 0:
@@ -494,6 +504,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         self.test_CE.reset()
 
     def test_step(self, batch, i):
+        step_start_time = time.time()
+        logging.info(f"[Rank {self.global_rank}] Starting test_step {i} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
         output, aux = self.encoder(batch)
 
         data = batch["graph"]
@@ -532,11 +545,13 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         predicted_mols = [list() for _ in range(len(data))]
         predicted_scores = [list() for _ in range(len(data))]
 
-        if self.global_rank == 0:
-            logging.info(f"Batch {i}: Generating {self.test_num_samples} molecules for {len(data)} samples...")
+        logging.info(f"[Rank {self.global_rank}] Batch {i}: Generating {self.test_num_samples} molecules for {len(data)} samples...")
 
         env_metas, spectra_arrays = extract_from_dataset_batch(batch, self.trainer.datamodule.test_dataset)
+        mcts_start_time = time.time()
         mcts_results = self.mcts_sample_batch(data, env_metas, spectra_arrays)
+        mcts_time = time.time() - mcts_start_time
+        logging.info(f"[Rank {self.global_rank}] Batch {i}: MCTS sampling completed in {mcts_time:.2f} seconds")
         for idx, sample_results in enumerate(mcts_results):
             # Extract molecules and scores from top-k results
             for smi, score, mol in sample_results:
@@ -554,19 +569,35 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             self.test_sim_metrics.update(predicted_mols[idx], true_mols[idx], scores=predicted_scores[idx])
             self.test_validity.update(predicted_mols[idx])
 
+        step_time = time.time() - step_start_time
+        logging.info(f"[Rank {self.global_rank}] Completed test_step {i} in {step_time:.2f} seconds (MCTS: {mcts_time:.2f}s)")
         return {'loss': nll}
 
     def on_test_epoch_end(self) -> None:
         """ Measure likelihood on a test set and compute stability metrics. """
+        logging.info(f"[Rank {self.global_rank}] Entering on_test_epoch_end at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
         # Synchronize all processes before merging (ensure all ranks finished writing)
+        # Use a timeout to prevent indefinite hanging
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            try:
+                # Set a timeout for the barrier (60 minutes as safety margin)
+                # Note: This is a workaround - the real issue is sync_dist=True below
+                logging.info(f"[Rank {self.global_rank}] Waiting at barrier for other ranks...")
+                # Barrier doesn't support timeout directly, so we'll rely on NCCL timeout
+                # Instead, add logging to identify which rank is slow
+                torch.distributed.barrier()
+                logging.info(f"[Rank {self.global_rank}] Barrier passed - all ranks synchronized")
+            except Exception as e:
+                logging.error(f"[Rank {self.global_rank}] Barrier failed: {e}")
+                # Continue anyway - the sync_dist=True will handle synchronization
         
         # Merge rank-specific prediction files and caches (only on rank 0)
         # if self.global_rank == 0:
         #     self._merge_distributed_predictions(stage='test')
         #     self._merge_distributed_caches()
         
+        logging.info(f"[Rank {self.global_rank}] Computing metrics...")
         metrics = [
             self.test_nll.compute(), 
             self.test_X_kl.compute(), 
@@ -585,6 +616,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             "test/E_CE": metrics[5]
         }
 
+        logging.info(f"[Rank {self.global_rank}] Logging metrics with sync_dist=True (this may wait for slow ranks)...")
         self.log_dict(log_dict, sync_dist=True)
         if self.global_rank == 0:
             logging.info(f"Epoch {self.current_epoch}: Test NLL {metrics[0] :.2f} -- Test Atom type KL {metrics[1] :.2f} -- Test Edge type KL: {metrics[2] :.2f} -- Test Edge type logp: {metrics[3] :.2f} -- Test Edge type CE: {metrics[5] :.2f}")
@@ -596,7 +628,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             log_dict[f"test/{key}"] = value
         log_dict["test/validity"] = self.test_validity.compute()
 
+        logging.info(f"[Rank {self.global_rank}] Logging final metrics with sync_dist=True...")
         self.log_dict(log_dict, sync_dist=True)
+        logging.info(f"[Rank {self.global_rank}] Completed on_test_epoch_end")
         
     def apply_noise(self, X, E, y, node_mask):
         """ Sample noise and apply it to the data. """

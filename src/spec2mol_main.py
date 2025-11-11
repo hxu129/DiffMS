@@ -328,8 +328,20 @@ def main(cfg: DictConfig):
         loggers.append(WandbLogger(name=name, save_dir=f"logs/{name}", project=cfg.general.wandb_name, log_model=False, config=utils.cfg_to_dict(cfg)))
 
     use_gpu = cfg.general.gpus > 0 and torch.cuda.is_available()
+    
+    # Configure DDP strategy with increased timeout to prevent timeouts during long MCTS inference
+    # Default timeout is 30 minutes (1800s), increase to 2 hours (7200s) for safety
+    # This is especially important when different ranks take varying amounts of time for MCTS sampling
+    from pytorch_lightning.strategies import DDPStrategy
+    import datetime
+    ddp_strategy = DDPStrategy(
+        find_unused_parameters=True,
+        timeout=datetime.timedelta(seconds=7200)  # 2 hours (default is 1800s = 30 minutes)
+    )
+    logging.info(f"Configured DDP strategy with timeout=7200s (2 hours) to prevent timeouts during long MCTS inference")
+    
     trainer = Trainer(gradient_clip_val=cfg.train.clip_grad,
-                      strategy="ddp_find_unused_parameters_true",  # Needed to load old checkpoints
+                      strategy=ddp_strategy,
                       accelerator='gpu' if use_gpu else 'cpu',
                       devices=cfg.general.gpus if use_gpu else 1,
                       max_epochs=cfg.train.n_epochs,
