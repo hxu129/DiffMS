@@ -1,4 +1,4 @@
-# conda install pytorch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 pytorch-cuda=11.8 -c pytorch -c nvidia
+pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cu118
 
 # conda install -c dglteam/label/th24_cu118 dgl
 
@@ -13,3 +13,15 @@ wget https://data.pyg.org/whl/torch-2.3.0%2Bcu118/torch_scatter-2.1.2%2Bpt23cu11
 wget https://data.pyg.org/whl/torch-2.3.0%2Bcu118/torch_sparse-0.6.18%2Bpt23cu118-cp39-cp39-linux_x86_64.whl
 
 wget https://data.pyg.org/whl/torch-2.3.0%2Bcu118/torch_spline_conv-1.2.2%2Bpt23cu118-cp39-cp39-linux_x86_64.whl
+
+pip install *whl
+
+rm *.whl
+
+pip install -e .
+
+cd ../ms-pred
+
+git checkout iceberg_analychem_2024
+
+pip install -e .
