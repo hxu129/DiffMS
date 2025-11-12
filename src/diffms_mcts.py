@@ -506,14 +506,18 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 
                 waiting_ranks = [r for r in range(world_size) if r != self.global_rank and r not in active_ranks]
                 
-                if len(active_ranks) > 0:
+                # Filter active_ranks to exclude those waiting at barrier
+                working_ranks = {r: info for r, info in active_ranks.items() 
+                                if not info['status'].startswith('barrier_')}
+                
+                if len(working_ranks) > 0:
                     # Some ranks are still working - log and continue waiting
-                    active_status = ", ".join([f"R{r}:{info['status']}" for r, info in active_ranks.items()])
-                    logging.info(f"[Rank {self.global_rank}] Smart barrier: {len(active_ranks)} ranks still working "
-                               f"({active_status}), waiting... (elapsed: {elapsed:.1f}s)")
+                    working_status = ", ".join([f"R{r}:{info['status']}" for r, info in working_ranks.items()])
+                    logging.info(f"[Rank {self.global_rank}] Smart barrier: {len(working_ranks)} ranks still working "
+                               f"({working_status}), waiting... (elapsed: {elapsed:.1f}s)")
                     # Reset timeout since we detected active ranks
                     start_time = time.time()  # Reset timeout counter
-                elif len(waiting_ranks) == world_size - 1:
+                elif len(waiting_ranks) == world_size - 1 or len(active_ranks) == world_size - 1:
                     # All other ranks are also at barrier - try actual barrier
                     try:
                         torch.distributed.barrier()
