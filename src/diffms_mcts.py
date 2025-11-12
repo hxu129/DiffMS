@@ -11,6 +11,8 @@ import pytorch_lightning as pl
 from torch_geometric.data import Batch
 from rdkit import Chem
 from rdkit.Chem import AllChem
+import threading
+from pathlib import Path
 
 from src.mcts_utils import extract_from_dataset_batch
 from src.models.transformer_model import GraphTransformer
@@ -163,6 +165,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         self.val_sim_metrics = K_SimilarityCollection(list(range(1, self.val_num_samples + 1)))
         self.val_validity = Validity()
         self.val_CE = CrossEntropyMetric()
+        
+        # Score@k metric: average score of top-k predictions
+        self.val_score_at_k = {k: [] for k in range(1, self.val_num_samples + 1)}
 
         self.test_nll = NLL()
         self.test_X_kl = SumExceptBatchKL()
@@ -173,6 +178,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         self.test_sim_metrics = K_SimilarityCollection(list(range(1, self.test_num_samples + 1)))
         self.test_validity = Validity()
         self.test_CE = CrossEntropyMetric()
+        
+        # Score@k metric: average score of top-k predictions
+        self.test_score_at_k = {k: [] for k in range(1, self.test_num_samples + 1)}
 
         self.train_metrics = train_metrics
 
@@ -285,6 +293,14 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         self.log_every_steps = cfg.general.log_every_steps
         self.best_val_nll = 1e8
         
+        # Progress monitoring for smart barrier
+        self.progress_dir = Path.cwd() / 'rank_progress'
+        self.progress_dir.mkdir(exist_ok=True)
+        self.progress_file = self.progress_dir / f'rank_{self.global_rank}_progress.txt'
+        self.last_progress_update = time.time()
+        self.current_step = None
+        self.current_batch = None
+        
         # Initialize MCTS configuration
         self._init_mcts_config()
 
@@ -361,6 +377,181 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             return
         self.verifier = build_verifier(self.cfg, ddp_rank=self.global_rank)
         self._verifier_ready = True
+    
+    def _update_progress(self, status: str, batch_idx: int, progress_pct: float = 0.0):
+        """
+        Update progress file to indicate this rank is still working.
+        
+        Args:
+            status: Current status (e.g., "test_step", "mcts_sampling", "completed")
+            batch_idx: Current batch index
+            progress_pct: Progress percentage (0-100)
+        """
+        try:
+            current_time = time.time()
+            self.last_progress_update = current_time
+            self.current_step = status
+            self.current_batch = batch_idx
+            
+            # Write progress to file (atomic write)
+            progress_data = {
+                'rank': self.global_rank,
+                'status': status,
+                'batch_idx': batch_idx,
+                'progress_pct': progress_pct,
+                'timestamp': current_time,
+                'elapsed_time': current_time - (getattr(self, 'step_start_time', current_time))
+            }
+            
+            # Use temp file + rename for atomic write
+            temp_file = self.progress_file.with_suffix('.tmp')
+            with open(temp_file, 'w') as f:
+                f.write(f"{progress_data['rank']}\t{progress_data['status']}\t{progress_data['batch_idx']}\t"
+                       f"{progress_data['progress_pct']:.2f}\t{progress_data['timestamp']:.3f}\t"
+                       f"{progress_data['elapsed_time']:.2f}\n")
+            temp_file.replace(self.progress_file)
+        except Exception as e:
+            # Don't fail if progress update fails
+            logging.debug(f"[Rank {self.global_rank}] Failed to update progress: {e}")
+    
+    def _check_other_ranks_progress(self, world_size: int, max_stale_time: float = 300.0) -> Dict[int, Dict]:
+        """
+        Check progress of other ranks to see if they're still working.
+        
+        Args:
+            world_size: Total number of ranks
+            max_stale_time: Maximum time (seconds) before considering a rank stale/dead
+            
+        Returns:
+            Dict mapping rank -> progress info, only includes ranks that are still active
+        """
+        active_ranks = {}
+        current_time = time.time()
+        
+        for rank in range(world_size):
+            if rank == self.global_rank:
+                continue
+                
+            progress_file = self.progress_dir / f'rank_{rank}_progress.txt'
+            if not progress_file.exists():
+                continue
+            
+            try:
+                with open(progress_file, 'r') as f:
+                    line = f.readline().strip()
+                    if not line:
+                        continue
+                    
+                    parts = line.split('\t')
+                    if len(parts) >= 5:
+                        rank_id = int(parts[0])
+                        status = parts[1]
+                        batch_idx = int(parts[2])
+                        progress_pct = float(parts[3])
+                        timestamp = float(parts[4])
+                        
+                        time_since_update = current_time - timestamp
+                        
+                        # Only consider ranks that have updated recently
+                        if time_since_update < max_stale_time:
+                            active_ranks[rank_id] = {
+                                'status': status,
+                                'batch_idx': batch_idx,
+                                'progress_pct': progress_pct,
+                                'last_update': timestamp,
+                                'time_since_update': time_since_update
+                            }
+            except Exception as e:
+                logging.debug(f"[Rank {self.global_rank}] Failed to read progress for rank {rank}: {e}")
+        
+        return active_ranks
+    
+    def _smart_barrier(self, context: str = "barrier", 
+                      check_interval: float = 60.0,
+                      max_stale_time: float = 300.0,
+                      base_timeout: float = 3600.0):
+        """
+        Smart barrier that waits for other ranks, but extends timeout if they're still working.
+        
+        Strategy:
+        - If other ranks are still updating progress, keep waiting (they're working)
+        - Only timeout if ranks haven't updated for max_stale_time (they're stuck/dead)
+        - Dynamically adjust timeout based on observed progress
+        
+        Args:
+            context: Context string for logging
+            check_interval: How often to check other ranks' progress (seconds)
+            max_stale_time: Maximum time without progress update before considering rank dead (seconds)
+            base_timeout: Base timeout for barrier (seconds)
+        """
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return
+        
+        world_size = torch.distributed.get_world_size()
+        start_time = time.time()
+        last_check_time = start_time
+        
+        logging.info(f"[Rank {self.global_rank}] Entering smart barrier ({context})...")
+        
+        # Update our progress to indicate we're waiting at barrier
+        self._update_progress(f"barrier_{context}", -1, 0.0)
+        
+        while True:
+            elapsed = time.time() - start_time
+            
+            # Check other ranks' progress periodically
+            if time.time() - last_check_time >= check_interval:
+                active_ranks = self._check_other_ranks_progress(world_size, max_stale_time)
+                last_check_time = time.time()
+                
+                waiting_ranks = [r for r in range(world_size) if r != self.global_rank and r not in active_ranks]
+                
+                if len(active_ranks) > 0:
+                    # Some ranks are still working - log and continue waiting
+                    active_status = ", ".join([f"R{r}:{info['status']}" for r, info in active_ranks.items()])
+                    logging.info(f"[Rank {self.global_rank}] Smart barrier: {len(active_ranks)} ranks still working "
+                               f"({active_status}), waiting... (elapsed: {elapsed:.1f}s)")
+                    # Reset timeout since we detected active ranks
+                    start_time = time.time()  # Reset timeout counter
+                elif len(waiting_ranks) == world_size - 1:
+                    # All other ranks are also at barrier - try actual barrier
+                    try:
+                        torch.distributed.barrier()
+                        logging.info(f"[Rank {self.global_rank}] Smart barrier passed - all ranks synchronized")
+                        break
+                    except Exception as e:
+                        logging.warning(f"[Rank {self.global_rank}] Barrier failed, retrying: {e}")
+                        time.sleep(1)
+                        continue
+                else:
+                    # Some ranks haven't updated in a while - check if they're truly dead
+                    stale_ranks = waiting_ranks
+                    logging.warning(f"[Rank {self.global_rank}] Smart barrier: {len(stale_ranks)} ranks appear stale "
+                                  f"(R{stale_ranks}), but continuing to wait... (elapsed: {elapsed:.1f}s)")
+            
+            # Check if we've exceeded base timeout (but only if no ranks are active)
+            if elapsed > base_timeout:
+                active_ranks = self._check_other_ranks_progress(world_size, max_stale_time)
+                if len(active_ranks) == 0:
+                    # No active ranks and timeout exceeded - this might be a real problem
+                    logging.error(f"[Rank {self.global_rank}] Smart barrier timeout after {elapsed:.1f}s "
+                                f"with no active ranks detected. Attempting barrier anyway...")
+                    try:
+                        torch.distributed.barrier()
+                        logging.info(f"[Rank {self.global_rank}] Barrier passed after timeout")
+                        break
+                    except Exception as e:
+                        logging.error(f"[Rank {self.global_rank}] Barrier failed after timeout: {e}")
+                        # Continue waiting - maybe ranks will recover
+                        start_time = time.time()  # Reset timeout
+                else:
+                    # Active ranks detected - extend timeout
+                    logging.info(f"[Rank {self.global_rank}] Extending timeout due to active ranks "
+                               f"(elapsed: {elapsed:.1f}s)")
+                    start_time = time.time()  # Reset timeout counter
+            
+            # Small sleep to avoid busy waiting
+            time.sleep(min(check_interval / 4, 5.0))
 
     def on_validation_epoch_start(self) -> None:
         if self.global_rank == 0:
@@ -374,6 +565,9 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         self.val_sim_metrics.reset()
         self.val_validity.reset()
         self.val_CE.reset()
+        
+        # Reset score@k tracking
+        self.val_score_at_k = {k: [] for k in range(1, self.val_num_samples + 1)}
 
     def validation_step(self, batch, i):
         output, aux = self.encoder(batch)
@@ -435,6 +629,14 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             self.val_k_acc.update(predicted_mols[idx], true_mols[idx], scores=predicted_scores[idx])
             self.val_sim_metrics.update(predicted_mols[idx], true_mols[idx], scores=predicted_scores[idx])
             self.val_validity.update(predicted_mols[idx])
+            
+            # Compute score@k: average score of top-k predictions
+            if len(predicted_scores[idx]) > 0:
+                sorted_scores = sorted(predicted_scores[idx], reverse=True)
+                for k in range(1, self.val_num_samples + 1):
+                    if k <= len(sorted_scores):
+                        avg_score = np.mean(sorted_scores[:k])
+                        self.val_score_at_k[k].append(avg_score)
 
         return {'loss': nll}
 
@@ -443,13 +645,12 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         logging.info(f"[Rank {self.global_rank}] Entering on_validation_epoch_end at {time.strftime('%Y-%m-%d %H:%M:%S')}")
         
         # Synchronize all processes before merging (ensure all ranks finished writing)
+        # Use smart barrier that waits for active ranks but times out for stuck ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            logging.info(f"[Rank {self.global_rank}] Waiting at barrier for other ranks...")
-            try:
-                torch.distributed.barrier()
-                logging.info(f"[Rank {self.global_rank}] Barrier passed - all ranks synchronized")
-            except Exception as e:
-                logging.error(f"[Rank {self.global_rank}] Barrier failed: {e}")
+            self._smart_barrier(context="validation_epoch_end", 
+                              check_interval=60.0,  # Check every minute
+                              max_stale_time=300.0,  # 5 minutes without update = stale
+                              base_timeout=3600.0)  # 1 hour base timeout
         
         # Merge rank-specific prediction files and caches (only on rank 0)
         # if self.global_rank == 0:
@@ -485,6 +686,11 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         for key, value in self.val_sim_metrics.compute().items():
             log_dict[f"val/{key}"] = value
         log_dict["val/validity"] = self.val_validity.compute()
+        
+        # Add score@k metrics
+        for k in [1, 5, 10, 20, 50, 100]:
+            if k <= self.val_num_samples and k in self.val_score_at_k and len(self.val_score_at_k[k]) > 0:
+                log_dict[f"val/score_at_{k}"] = float(np.mean(self.val_score_at_k[k]))
 
         logging.info(f"[Rank {self.global_rank}] Logging final validation metrics with sync_dist=True...")
         self.log_dict(log_dict, sync_dist=True)
@@ -502,10 +708,17 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         self.test_sim_metrics.reset()
         self.test_validity.reset()
         self.test_CE.reset()
+        
+        # Reset score@k tracking
+        self.test_score_at_k = {k: [] for k in range(1, self.test_num_samples + 1)}
 
     def test_step(self, batch, i):
         step_start_time = time.time()
+        self.step_start_time = step_start_time
         logging.info(f"[Rank {self.global_rank}] Starting test_step {i} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Update progress: starting test step
+        self._update_progress("test_step_start", i, 0.0)
         
         output, aux = self.encoder(batch)
 
@@ -547,11 +760,17 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         logging.info(f"[Rank {self.global_rank}] Batch {i}: Generating {self.test_num_samples} molecules for {len(data)} samples...")
 
+        # Update progress: starting MCTS sampling
+        self._update_progress("mcts_sampling", i, 0.0)
+        
         env_metas, spectra_arrays = extract_from_dataset_batch(batch, self.trainer.datamodule.test_dataset)
         mcts_start_time = time.time()
         mcts_results = self.mcts_sample_batch(data, env_metas, spectra_arrays)
         mcts_time = time.time() - mcts_start_time
         logging.info(f"[Rank {self.global_rank}] Batch {i}: MCTS sampling completed in {mcts_time:.2f} seconds")
+        
+        # Update progress: MCTS completed
+        self._update_progress("mcts_completed", i, 50.0)
         for idx, sample_results in enumerate(mcts_results):
             # Extract molecules and scores from top-k results
             for smi, score, mol in sample_results:
@@ -568,9 +787,21 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             self.test_k_acc.update(predicted_mols[idx], true_mols[idx], scores=predicted_scores[idx])
             self.test_sim_metrics.update(predicted_mols[idx], true_mols[idx], scores=predicted_scores[idx])
             self.test_validity.update(predicted_mols[idx])
+            
+            # Compute score@k: average score of top-k predictions
+            if len(predicted_scores[idx]) > 0:
+                sorted_scores = sorted(predicted_scores[idx], reverse=True)
+                for k in range(1, self.test_num_samples + 1):
+                    if k <= len(sorted_scores):
+                        avg_score = np.mean(sorted_scores[:k])
+                        self.test_score_at_k[k].append(avg_score)
 
         step_time = time.time() - step_start_time
         logging.info(f"[Rank {self.global_rank}] Completed test_step {i} in {step_time:.2f} seconds (MCTS: {mcts_time:.2f}s)")
+        
+        # Update progress: test step completed
+        self._update_progress("test_step_completed", i, 100.0)
+        
         return {'loss': nll}
 
     def on_test_epoch_end(self) -> None:
@@ -578,19 +809,12 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         logging.info(f"[Rank {self.global_rank}] Entering on_test_epoch_end at {time.strftime('%Y-%m-%d %H:%M:%S')}")
         
         # Synchronize all processes before merging (ensure all ranks finished writing)
-        # Use a timeout to prevent indefinite hanging
+        # Use smart barrier that waits for active ranks but times out for stuck ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            try:
-                # Set a timeout for the barrier (60 minutes as safety margin)
-                # Note: This is a workaround - the real issue is sync_dist=True below
-                logging.info(f"[Rank {self.global_rank}] Waiting at barrier for other ranks...")
-                # Barrier doesn't support timeout directly, so we'll rely on NCCL timeout
-                # Instead, add logging to identify which rank is slow
-                torch.distributed.barrier()
-                logging.info(f"[Rank {self.global_rank}] Barrier passed - all ranks synchronized")
-            except Exception as e:
-                logging.error(f"[Rank {self.global_rank}] Barrier failed: {e}")
-                # Continue anyway - the sync_dist=True will handle synchronization
+            self._smart_barrier(context="test_epoch_end",
+                              check_interval=60.0,  # Check every minute
+                              max_stale_time=300.0,  # 5 minutes without update = stale
+                              base_timeout=7200.0)  # 2 hours base timeout (matching DDP timeout)
         
         # Merge rank-specific prediction files and caches (only on rank 0)
         # if self.global_rank == 0:
@@ -627,6 +851,11 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         for key, value in self.test_sim_metrics.compute().items():
             log_dict[f"test/{key}"] = value
         log_dict["test/validity"] = self.test_validity.compute()
+        
+        # Add score@k metrics
+        for k in [1, 5, 10, 20, 50, 100]:
+            if k <= self.test_num_samples and k in self.test_score_at_k and len(self.test_score_at_k[k]) > 0:
+                log_dict[f"test/score_at_{k}"] = float(np.mean(self.test_score_at_k[k]))
 
         logging.info(f"[Rank {self.global_rank}] Logging final metrics with sync_dist=True...")
         self.log_dict(log_dict, sync_dist=True)
