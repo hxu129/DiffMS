@@ -1,20 +1,21 @@
-BIN_SIZE=10.0
-C_PUCT=5
-NUM_SIMULATION_STEPS=5000
-BRANCH_K=2
+BIN_SIZE=0.1
+C_PUCT=1.414
+NUM_SIMULATION_STEPS=1667
+BRANCH_K=3
+TEMPERATURE_VALUES="[0.5,1.0,1.5]"
 PREDIFFUSE_STEPS=300
-EXPAND_STEPS=5
+EXPAND_STEPS=10
 EVAL_FULL_MOL=True
 
-for C_PUCT in 1.0; do
+# for C_PUCT in 1.0; do
 HYDRA_FULL_ERROR=0 CUDA_VISIBLE_DEVICES=0,1,2,3 python src/spec2mol_main.py \
-    train.eval_batch_size=128 \
-    dataset.max_count=3000 \
-    general.validate_only=/local3/ericjiang/wgc/huaxu/ms/DiffMS/checkpoints/diffms_canopus.ckpt \
+    train.eval_batch_size=64 \
+    dataset.max_count=null \
+    general.test_only=/root/ms/DiffMS/checkpoints/diffms_canopus.ckpt \
     general.name=examine-mcts-evalfullmol-${EVAL_FULL_MOL}-c-puct-${C_PUCT}-bin-size-${BIN_SIZE}-branch-${BRANCH_K}-num-simulation-steps-${NUM_SIMULATION_STEPS}-prediffuse-steps-${PREDIFFUSE_STEPS}-expand-steps-${EXPAND_STEPS} \
     general.wandb_name=test \
-    general.test_samples_to_generate=10 \
-    general.val_samples_to_generate=10 \
+    general.test_samples_to_generate=100 \
+    general.val_samples_to_generate=100 \
     general.gpus=4 \
     general.seed=123 \
     mcts.use_mcts=true \
@@ -33,5 +34,5 @@ HYDRA_FULL_ERROR=0 CUDA_VISIBLE_DEVICES=0,1,2,3 python src/spec2mol_main.py \
     mcts.eval_full_mol=${EVAL_FULL_MOL} \
     mcts.use_lmdb_cache=true \
     mcts.use_temperature=true \
-    mcts.temperature_values=[1.0,1.5]
-done
+    mcts.temperature_values=${TEMPERATURE_VALUES}
+# done

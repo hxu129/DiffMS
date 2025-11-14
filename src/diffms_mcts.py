@@ -997,10 +997,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
             tree = self._batched_backup(tree, new_child_indices, child_scores)
             
             # Debug logging: track metrics at regular intervals
-            if self.mcts_config['debug_logging'] and (sim_step + 1) % 50 == 0:
+            if self.mcts_config['debug_logging'] and (sim_step + 1) % 20 == 0:
                 self._log_mcts_metrics(tree, sim_step + 1, batch_size, new_child_indices)
             
-            if self.global_rank == 0 and (sim_step + 1) % 50 == 0:
+            if self.global_rank == 0 and (sim_step + 1) % 20 == 0:
                 logging.info(f"Completed {sim_step + 1}/{num_simulations} MCTS simulations")
         
         # Extract results from each tree
@@ -1299,12 +1299,21 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         all_scores = []
         if len(all_mols) > 0:
             self._ensure_verifier()
+            
+            # Get reward function parameters from config
+            use_logit_sigmoid = getattr(self.cfg.mcts, 'use_logit_sigmoid_reward', False)
+            reward_weights = getattr(self.cfg.mcts, 'reward_weights', None)
+            sigmoid_steepness = getattr(self.cfg.mcts, 'sigmoid_steepness', None)
+            
             all_scores = self.verifier.score_batch(
                 all_mols, all_smis,
                 all_precursor_mzs, all_adducts,
                 all_instruments, all_collision_engs,
                 all_target_specs,
-                bin_size=self.cfg.mcts.similarity.bin_size
+                bin_size=self.cfg.mcts.similarity.bin_size,
+                use_logit_sigmoid=use_logit_sigmoid,
+                reward_weights=reward_weights,
+                sigmoid_steepness=sigmoid_steepness
             )
         
         # Phase 3: Scatter scores back to per-sample results
@@ -2408,7 +2417,18 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
                 mol_indices_map[smi].append(i)
 
             # Score only unique SMILES
-            unique_scores = self.verifier.score_batch(*zip(*list(unique_smiles.values())), bin_size=self.cfg.mcts.similarity.bin_size)
+            # Get reward function parameters from config
+            use_logit_sigmoid = getattr(self.cfg.mcts, 'use_logit_sigmoid_reward', False)
+            reward_weights = getattr(self.cfg.mcts, 'reward_weights', None)
+            sigmoid_steepness = getattr(self.cfg.mcts, 'sigmoid_steepness', None)
+            
+            unique_scores = self.verifier.score_batch(
+                *zip(*list(unique_smiles.values())), 
+                bin_size=self.cfg.mcts.similarity.bin_size,
+                use_logit_sigmoid=use_logit_sigmoid,
+                reward_weights=reward_weights,
+                sigmoid_steepness=sigmoid_steepness
+            )
 
             # Remap scores to original indices
             batch_scores = torch.zeros(N, device=device)

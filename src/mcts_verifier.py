@@ -8,6 +8,11 @@ if 'rdkit' not in sys.modules:
     for level in ['rdApp', 'rdApp.info', 'rdApp.warning', 'rdApp.error',
                   'rdMol', 'rdSanit', 'rdGeneral']:
         RDLogger.DisableLog(level)
+import sys
+import os
+sys.path.append(os.path.join(os.environ['CONDA_PREFIX'],'share','RDKit','Contrib'))
+
+from SA_Score import sascorer
 
 import numpy as np
 import torch
@@ -43,11 +48,198 @@ RDLogger.DisableLog('rdGeneral')  # Disable general warnings
 warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message='.*non-writable.*')
 
+# Default reward weights for Logit-Sigmoid reward function
+# These can be overridden via config file (see configs/reward_config_example.yaml)
+# or by passing reward_weights parameter to score_batch()
+DEFAULT_REWARD_WEIGHTS = {
+    'w_spec': 2.0,      # Main driver - spectral similarity
+    'w_valid': -1.0,    # Penalize invalid valence (negative weight)
+    'w_qed': 0.5,       # Mild QED encouragement
+    'w_sa': -0.5,       # Penalize poor synthetic accessibility (negative weight)
+}
+DEFAULT_SIGMOID_STEEPNESS = 1.0
+
 # Global worker state (initialized once per worker process)
 _worker_joint_model = None
 _worker_graff_model = None
 _worker_graff_featurizer = None
 cosine = similarity.CosineGreedy(tolerance=0.01)
+
+# ============================================================================
+# Reward Component Functions for Logit-Sigmoid Reward
+# ============================================================================
+
+def _compute_f_spec(sim_cos: float) -> float:
+    """
+    Centered spectral similarity feature.
+    
+    Args:
+        sim_cos: Cosine similarity in [0, 1]
+    
+    Returns:
+        Centered similarity in [-0.5, 0.5]
+    """
+    return sim_cos - 0.5
+
+
+def _compute_f_valid(mol: Chem.Mol) -> float:
+    """
+    Valence validity penalty - sum of valence deviations.
+    Uses RDKit's periodic table to get standard valence values.
+    
+    Args:
+        mol: RDKit molecule object
+    
+    Returns:
+        Sum of valence deviations (0 = all valid, higher = more errors)
+    """
+    pt = Chem.GetPeriodicTable()
+    total_deviation = 0.0
+    
+    for atom in mol.GetAtoms():
+        atomic_num = atom.GetAtomicNum()
+        
+        # Get actual total valence
+        try:
+            actual_valence = atom.GetTotalValence()
+        except:
+            # If we can't get valence, assume error
+            total_deviation += 1.0
+            continue
+        
+        # Get expected valence list from RDKit's periodic table
+        try:
+            expected_valences = pt.GetValenceList(atomic_num)
+        except:
+            # If element not in periodic table, skip
+            continue
+        
+        # If no expected valences defined, skip
+        if not expected_valences:
+            continue
+        
+        # If actual valence matches any expected, no penalty
+        if actual_valence in expected_valences:
+            continue
+        
+        # Otherwise, compute minimum deviation
+        min_deviation = min(abs(actual_valence - exp_val) for exp_val in expected_valences)
+        total_deviation += min_deviation
+    
+    return total_deviation
+
+
+def _compute_f_qed(mol: Chem.Mol) -> float:
+    """
+    Centered drug-likeness feature using QED.
+    
+    Args:
+        mol: RDKit molecule object
+    
+    Returns:
+        Centered QED in [-0.5, 0.5]
+    """
+    try:
+        from rdkit.Chem import QED
+        # Try to ensure molecule is in valid state
+        try:
+            # Update property cache to avoid valence errors
+            for atom in mol.GetAtoms():
+                atom.UpdatePropertyCache(strict=False)
+        except:
+            pass  # If this fails, try QED anyway
+        
+        qed_score = QED.qed(mol)
+        return qed_score - 0.5
+    except Exception:
+        # Silently fail for invalid molecules - they'll be penalized via f_valid
+        return -0.5  # Assume worst case if computation fails
+
+
+def _compute_f_sa(mol: Chem.Mol) -> float:
+    """
+    Synthetic accessibility penalty using SA-Score.
+    
+    Args:
+        mol: RDKit molecule object
+    
+    Returns:
+        SA penalty in [0, 1] where 0=easy to synthesize, 1=hard to synthesize
+    """
+    try:
+        # Try to ensure molecule is in valid state before SA-Score calculation
+        try:
+            # Calculate implicit valence to avoid pre-condition violation
+            for atom in mol.GetAtoms():
+                atom.UpdatePropertyCache(strict=False)
+            Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
+        except:
+            pass  # If sanitization fails, try SA-Score anyway
+        
+        sa_score = sascorer.calculateScore(mol)
+        # SA-Score ranges from 1 (easy) to 10 (hard)
+        # Convert to penalty: (10 - sa_score) / 9 gives [0, 1]
+        # where 0 = easy (sa_score=10), 1 = hard (sa_score=1)
+        penalty = (10.0 - sa_score) / 9.0
+        return penalty
+    except Exception:
+        # Silently fail for invalid molecules - they'll be penalized via f_valid
+        return 0.5  # Assume moderate difficulty if computation fails
+
+
+def _compute_logit_sigmoid_reward(mol: Chem.Mol, sim_cos: float, 
+                                  weights: dict, k: float) -> float:
+    """
+    Compute unified reward using Logit-Sigmoid transformation.
+    
+    The reward combines multiple molecular properties through a logit (log-odds)
+    that is then transformed via sigmoid to [0, 1].
+    
+    Algorithm:
+        1. Compute feature functions: f_spec, f_valid, f_qed, f_sa
+        2. Compute logit: L = w_spec*f_spec + w_valid*f_valid + w_qed*f_qed + w_sa*f_sa
+        3. Apply sigmoid: R = 1 / (1 + exp(-k*L))
+    
+    Args:
+        mol: RDKit molecule object
+        sim_cos: Cosine similarity score in [0, 1]
+        weights: Dict with keys 'w_spec', 'w_valid', 'w_qed', 'w_sa'
+        k: Sigmoid steepness parameter (higher = steeper)
+    
+    Returns:
+        Unified reward in (0, 1)
+    """
+    # Compute all feature functions
+    f_spec = _compute_f_spec(sim_cos)
+    f_valid = _compute_f_valid(mol)
+    f_qed = _compute_f_qed(mol)
+    f_sa = _compute_f_sa(mol)
+    
+    # Compute logit (log-odds)
+    L = (weights['w_spec'] * f_spec + 
+         weights['w_valid'] * f_valid + 
+         weights['w_qed'] * f_qed + 
+         weights['w_sa'] * f_sa)
+    
+    # Apply sigmoid transformation
+    # R = 1 / (1 + exp(-k*L))
+    import math
+    try:
+        R = 1.0 / (1.0 + math.exp(-k * L))
+    except OverflowError:
+        # Handle extreme values
+        if L > 0:
+            R = 1.0
+        else:
+            R = 0.0
+    
+    return R
+
+
+# ============================================================================
+# Spectrum Processing Functions
+# ============================================================================
+
 def _bin_and_score_vectorized(pred_spec: np.ndarray, target_spec: np.ndarray, 
                                 mz_min: int = 0, mz_max: int = 1000, bin_size: float = 1.0) -> float:
     """Single-pass binned cosine similarity - FASTEST version."""
@@ -598,7 +790,7 @@ class GraffMSVerifier(BaseVerifier):
             try:
                 from lmdb_cache import LMDBCache
                 # Use cache_dir directly as LMDB path
-                self.lmdb_cache = LMDBCache(cache_dir, map_size=60 * 1024**3)  # 60GB max (increased from 40GB)
+                self.lmdb_cache = LMDBCache(cache_dir, map_size=40 * 1024**3)  # 40GB max
                 logging.info(f"[Rank {ddp_rank}] Using LMDB cache at {cache_dir}")
                 stats = self.lmdb_cache.get_stats()
                 logging.info(f"[Rank {ddp_rank}] LMDB cache loaded: {stats['spectra_count']} spectra")
@@ -776,13 +968,41 @@ class GraffMSVerifier(BaseVerifier):
                    instruments: List[Optional[str]],
                    collision_engs: List[Optional[float]],
                    target_spectra_list: List[np.ndarray],
-                   bin_size: float = 1.0) -> List[float]:
-        """GPU-batched scoring with persistent caching."""
+                   bin_size: float = 1.0,
+                   use_logit_sigmoid: bool = False,
+                   reward_weights: Optional[dict] = None,
+                   sigmoid_steepness: Optional[float] = None) -> List[float]:
+        """
+        GPU-batched scoring with persistent caching.
+        
+        Args:
+            mol_list: List of RDKit molecule objects
+            smiles_list: List of SMILES strings
+            precursor_mzs: List of precursor m/z values
+            adducts: List of adduct strings
+            instruments: List of instrument types (optional)
+            collision_engs: List of collision energies (optional)
+            target_spectra_list: List of target spectra as numpy arrays
+            bin_size: Bin size for spectrum binning
+            use_logit_sigmoid: If True, use Logit-Sigmoid reward function (default: False)
+            reward_weights: Dict with keys 'w_spec', 'w_valid', 'w_qed', 'w_sa' (default: use DEFAULT_REWARD_WEIGHTS)
+            sigmoid_steepness: Sigmoid steepness parameter k (default: use DEFAULT_SIGMOID_STEEPNESS)
+        
+        Returns:
+            List of scores/rewards in [0, 1]
+        """
         if not mol_list:
             return []
         
         bin_size = float(bin_size)
         num_mols = len(mol_list)
+        
+        # Set default reward parameters if using logit-sigmoid
+        if use_logit_sigmoid:
+            if reward_weights is None:
+                reward_weights = DEFAULT_REWARD_WEIGHTS
+            if sigmoid_steepness is None:
+                sigmoid_steepness = DEFAULT_SIGMOID_STEEPNESS
         
         # Phase 1: Pre-filter using cache
         scores = [None] * num_mols  # Initialize results
@@ -796,17 +1016,34 @@ class GraffMSVerifier(BaseVerifier):
         cache_hits_spec = 0
         cache_misses = 0
         
+        # Create a hash for reward weights if using logit-sigmoid (for cache key)
+        if use_logit_sigmoid:
+            weights_str = "_".join(f"{k}={v:.4f}" for k, v in sorted(reward_weights.items()))
+            weights_hash = sha256(weights_str.encode()).hexdigest()[:8]  # Short hash
+        else:
+            weights_hash = None
+        
         for i, (mol, smi, adduct, t_spec) in enumerate(zip(mol_list, smiles_list, adducts, target_spectra_list)):
             # Create cache keys
             target_hash = sha256(t_spec.tobytes()).hexdigest()
             
+            # Extend cache keys to include reward mode
+            if use_logit_sigmoid:
+                score_cache_key = (smi, adduct, target_hash, bin_size, 'logit_sigmoid', weights_hash, sigmoid_steepness)
+            else:
+                score_cache_key = (smi, adduct, target_hash, bin_size, 'cosine')
+            spec_cache_key = (smi, adduct)  # Spectrum cache is independent of reward mode
+            
             if self.use_lmdb:
-                # Check score cache first (full hit)
-                cached_score = self.lmdb_cache.get_score(smi, adduct, target_hash, bin_size)
-                if cached_score is not None:
-                    scores[i] = cached_score
-                    cache_hits_score += 1
-                    continue
+                # LMDB cache doesn't support the extended cache keys (backward compatibility)
+                # For LMDB, we skip score caching when using logit-sigmoid
+                if not use_logit_sigmoid:
+                    # Check score cache first (full hit) - only for cosine mode
+                    cached_score = self.lmdb_cache.get_score(smi, adduct, target_hash, bin_size)
+                    if cached_score is not None:
+                        scores[i] = cached_score
+                        cache_hits_score += 1
+                        continue
                 
                 # Check spectrum cache (partial hit)
                 p_spec = self.lmdb_cache.get_spectrum(smi, adduct)
@@ -814,19 +1051,22 @@ class GraffMSVerifier(BaseVerifier):
                     try:
                         score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, 
                                                          bin_size=bin_size, mz_max=self.bins_upper_mz)
+                        
+                        # Apply logit-sigmoid transformation if enabled
+                        if use_logit_sigmoid:
+                            score = _compute_logit_sigmoid_reward(mol, score, reward_weights, sigmoid_steepness)
+                        
                         scores[i] = score
-                        # Save the computed score
-                        # Dont save the score to the LMDB cache to save space
-                        # self.lmdb_cache.put_score(smi, adduct, target_hash, bin_size, score)
+                        # Save the computed score (only in cosine mode for LMDB)
+                        if not use_logit_sigmoid:
+                            # Dont save the score to the LMDB cache to save space
+                            pass  # self.lmdb_cache.put_score(smi, adduct, target_hash, bin_size, score)
                         cache_hits_spec += 1
                         continue
                     except Exception as e:
                         logging.error(f"Scoring error for {smi}: {e}")
             else:
-                # Pickle cache lookup
-                spec_cache_key = (smi, adduct)
-                score_cache_key = (smi, adduct, target_hash, bin_size)
-                
+                # Pickle cache lookup (supports extended cache keys)
                 # Check score cache first (full hit)
                 if score_cache_key in self.scores_cache:
                     scores[i] = self.scores_cache[score_cache_key]
@@ -840,6 +1080,10 @@ class GraffMSVerifier(BaseVerifier):
                     try:
                         score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec, 
                                                          bin_size=bin_size, mz_max=self.bins_upper_mz)
+                        
+                        # Apply logit-sigmoid transformation if enabled
+                        if use_logit_sigmoid:
+                            score = _compute_logit_sigmoid_reward(mol, score, reward_weights, sigmoid_steepness)
                     except Exception as e:
                         logging.error(f"Scoring error for {smi}: {e}")
                         score = 0.0
@@ -904,8 +1148,8 @@ class GraffMSVerifier(BaseVerifier):
                 # Process results - convert to peak lists and score
                 bin_width = self.bins_upper_mz / binned_specs.shape[1]
                 
-                for i, (binned_spec, t_spec, smi, adduct, orig_idx) in enumerate(
-                    zip(binned_specs, batch_specs, batch_smiles, batch_adducts, batch_indices)
+                for i, (binned_spec, t_spec, smi, adduct, orig_idx, mol) in enumerate(
+                    zip(binned_specs, batch_specs, batch_smiles, batch_adducts, batch_indices, batch_mols)
                 ):
                     # Convert binned spec to peak list
                     peaks = [(idx * bin_width, inten) for idx, inten in enumerate(binned_spec) if inten > 0]
@@ -915,6 +1159,10 @@ class GraffMSVerifier(BaseVerifier):
                     try:
                         score = _bin_and_score_vectorized(pred_spec=p_spec, target_spec=t_spec,
                                                          bin_size=bin_size, mz_max=self.bins_upper_mz)
+                        
+                        # Apply logit-sigmoid transformation if enabled
+                        if use_logit_sigmoid:
+                            score = _compute_logit_sigmoid_reward(mol, score, reward_weights, sigmoid_steepness)
                     except Exception as e:
                         logging.error(f"Scoring error for {smi}: {e}")
                         score = 0.0
@@ -928,9 +1176,15 @@ class GraffMSVerifier(BaseVerifier):
                     
                     if self.use_lmdb:
                         self.lmdb_cache.put_spectrum(smi, adduct, p_spec)
-                        # self.lmdb_cache.put_score(smi, adduct, target_hash, bin_size, score)
+                        # LMDB doesn't cache scores in logit-sigmoid mode
+                        if not use_logit_sigmoid:
+                            pass  # self.lmdb_cache.put_score(smi, adduct, target_hash, bin_size, score)
                     else:
-                        score_cache_key = (smi, adduct, target_hash, bin_size)
+                        # Construct proper cache keys based on reward mode
+                        if use_logit_sigmoid:
+                            score_cache_key = (smi, adduct, target_hash, bin_size, 'logit_sigmoid', weights_hash, sigmoid_steepness)
+                        else:
+                            score_cache_key = (smi, adduct, target_hash, bin_size, 'cosine')
                         spec_cache_key = (smi, adduct)
                         self.spectra_cache[spec_cache_key] = p_spec
                         self.scores_cache[score_cache_key] = score

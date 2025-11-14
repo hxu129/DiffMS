@@ -15,11 +15,11 @@ use_lmdb_cache: false
 verifier_type: 'iceberg'
 
 graffms: 
-  checkpoint: '/local3/ericjiang/wgc/huaxu/ms/ms-pred/results/graff_ms_baseline_canopus_train_public/split_4_rnd1/version_7/best.ckpt'
+  checkpoint: '/root/ms/ms-pred/results/graff_ms_train_diffms_canopus/results/graff_ms_diffms_canopus/version_0/best.ckpt'
 
 iceberg:
-  gen_checkpoint: '/local3/ericjiang/wgc/huaxu/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_generate.ckpt'
-  inten_checkpoint: '/local3/ericjiang/wgc/huaxu/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_score.ckpt'
+  gen_checkpoint: '/root/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_generate.ckpt'
+  inten_checkpoint: '/root/ms/ms-pred/quickstart/iceberg/models/canopus_iceberg_score.ckpt'
 
 similarity:
   tolerance_da: 0.01
@@ -32,7 +32,7 @@ num_workers: 16
 
 expand_steps: 10
 
-cache_dir: '/local3/ericjiang/wgc/huaxu/ms/DiffMS/cache/graffms_lmdb/'
+cache_dir: '/root/autodl-tmp/DiffMS/cache/graffms_lmdb_new/'
 
 eval_full_mol: false
 
@@ -43,3 +43,29 @@ eval_full_mol: false
 # Higher temperature (> 1.0) = more random (exploration)
 use_temperature: false
 temperature_values: [1.0, 1.0, 1.0, 1.0, 1.0]  # Must match branch_k length
+
+# ========================================================================
+# Reward Function Configuration
+# ========================================================================
+  
+# Enable Logit-Sigmoid reward function (default: false for backward compatibility)
+# When false: uses standard cosine similarity only
+# When true: uses Logit-Sigmoid transformation combining multiple molecular properties
+use_logit_sigmoid_reward: true
+  
+# Reward weights for Logit-Sigmoid function
+# These weights control the contribution of each component in the logit calculation:
+# L(m) = w_spec*f_spec + w_valid*f_valid + w_qed*f_qed + w_sa*f_sa
+reward_weights:
+  w_spec: 4.0      # Spectral similarity weight (main driver, positive encourages higher similarity)
+  w_valid: -3.0    # Valence validity penalty weight (negative penalizes invalid valences)
+  w_qed: 0.05       # QED drug-likeness weight (positive encourages drug-like properties)
+  w_sa: -1.0       # Synthetic accessibility penalty weight (negative penalizes hard-to-synthesize)
+  
+# Sigmoid steepness parameter (k in the sigmoid function)
+# Controls how steep the sigmoid transformation is
+# Higher values = steeper curve (more aggressive differentiation)
+# Lower values = gentler curve (smoother gradients)
+# Default: 1.0
+sigmoid_steepness: 1.0
+  
